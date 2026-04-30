@@ -53,15 +53,14 @@ enum Prefs {
 
 final class SettingsWindowController: NSWindowController {
 
-    private let stackView = NSStackView()
-    private let scrollView = NSScrollView()
-    private var rowData: [(row: NSStackView, nameField: NSTextField, ipField: NSTextField)] = []
-
+    // Jede Zeile als Tupel gespeichert – kein ScrollView, kein NSTableView
+    private var rows: [(name: NSTextField, ip: NSTextField)] = []
+    private let outerStack = NSStackView()   // vertikaler Haupt-Stack
     var onSave: ([Device]) -> Void = { _ in }
 
     init(devices: [Device]) {
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 280),
+            contentRect: NSRect(x: 0, y: 0, width: 420, height: 160),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -75,106 +74,132 @@ final class SettingsWindowController: NSWindowController {
 
     private func buildUI(devices: [Device]) {
         guard let cv = window?.contentView else { return }
-        cv.wantsLayer = true
+
+        // Haupt-Stack: wächst nach unten mit jeder neuen Zeile
+        outerStack.orientation  = .vertical
+        outerStack.alignment    = .left
+        outerStack.spacing      = 8
+        outerStack.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(outerStack)
 
         // Spaltenköpfe
-        let h1 = columnHeader("Name")
-        let h2 = columnHeader("IP-Adresse")
-        let ph = NSView(); ph.widthAnchor.constraint(equalToConstant: 26).isActive = true
-        let headerRow = NSStackView(views: [h1, h2, ph])
-        headerRow.distribution = .fill
-        headerRow.spacing = 8
-        h1.widthAnchor.constraint(equalToConstant: 160).isActive = true
-        h2.widthAnchor.constraint(equalToConstant: 140).isActive = true
+        outerStack.addArrangedSubview(headerRow())
 
-        // Gerätzeilen-Stack
-        stackView.orientation = .vertical
-        stackView.alignment   = .leading
-        stackView.spacing     = 6
-        stackView.edgeInsets  = NSEdgeInsets(top: 8, left: 8, bottom: 8, right: 8)
-        stackView.addArrangedSubview(headerRow)
-
+        // Gerätezeilen
         for d in devices { appendRow(name: d.name, ip: d.ip) }
 
-        // ScrollView
-        scrollView.documentView = stackView
-        scrollView.hasVerticalScroller = true
-        scrollView.borderType = .bezelBorder
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-        cv.addSubview(scrollView)
-
-        // Buttons
-        let addBtn  = NSButton(title: "+ Gerät hinzufügen", target: self, action: #selector(addRow))
+        // Untere Button-Leiste: fest am unteren Fensterrand
+        let addBtn  = NSButton(title: "+ Gerät hinzufügen", target: self, action: #selector(addRowTapped))
         addBtn.bezelStyle = .rounded
         let saveBtn = NSButton(title: "Speichern", target: self, action: #selector(saveTapped))
-        saveBtn.bezelStyle = .rounded
+        saveBtn.bezelStyle    = .rounded
         saveBtn.keyEquivalent = "\r"
-        let spacer  = NSView()
-        let bottom  = NSStackView(views: [addBtn, spacer, saveBtn])
-        bottom.translatesAutoresizingMaskIntoConstraints = false
-        cv.addSubview(bottom)
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+
+        let bottomBar = NSStackView(views: [addBtn, spacer, saveBtn])
+        bottomBar.translatesAutoresizingMaskIntoConstraints = false
+        cv.addSubview(bottomBar)
 
         NSLayoutConstraint.activate([
-            scrollView.topAnchor    .constraint(equalTo: cv.topAnchor,         constant:  16),
-            scrollView.leadingAnchor.constraint(equalTo: cv.leadingAnchor,     constant:  16),
-            scrollView.trailingAnchor.constraint(equalTo: cv.trailingAnchor,   constant: -16),
-            scrollView.bottomAnchor .constraint(equalTo: bottom.topAnchor,     constant: -12),
-            bottom.leadingAnchor    .constraint(equalTo: cv.leadingAnchor,     constant:  16),
-            bottom.trailingAnchor   .constraint(equalTo: cv.trailingAnchor,    constant: -16),
-            bottom.bottomAnchor     .constraint(equalTo: cv.bottomAnchor,      constant: -16),
-            bottom.heightAnchor     .constraint(equalToConstant: 28),
+            // Haupt-Stack: oben links, volle Breite
+            outerStack.topAnchor    .constraint(equalTo: cv.topAnchor,      constant:  20),
+            outerStack.leadingAnchor.constraint(equalTo: cv.leadingAnchor,  constant:  20),
+            outerStack.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -20),
+
+            // Bottom-Bar: fest am Boden
+            bottomBar.leadingAnchor .constraint(equalTo: cv.leadingAnchor,  constant:  20),
+            bottomBar.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -20),
+            bottomBar.bottomAnchor  .constraint(equalTo: cv.bottomAnchor,   constant: -16),
+            bottomBar.heightAnchor  .constraint(equalToConstant: 28),
+
+            // Stack darf die Bottom-Bar nicht überlappen
+            outerStack.bottomAnchor.constraint(lessThanOrEqualTo: bottomBar.topAnchor, constant: -12),
         ])
 
-        stackView.widthAnchor.constraint(equalTo: scrollView.contentView.widthAnchor).isActive = true
+        updateWindowHeight()
     }
 
-    @objc private func addRow() { appendRow(name: "", ip: "") }
+    // Spaltenköpfe als eigene Zeile
+    private func headerRow() -> NSStackView {
+        let n = label("Name",       bold: true)
+        let i = label("IP-Adresse", bold: true)
+        n.widthAnchor.constraint(equalToConstant: 180).isActive = true
+        i.widthAnchor.constraint(equalToConstant: 140).isActive = true
+        let ph = NSView()
+        ph.widthAnchor.constraint(equalToConstant: 28).isActive = true
+        let s = NSStackView(views: [n, i, ph])
+        s.spacing = 8
+        return s
+    }
+
+    @objc private func addRowTapped() {
+        appendRow(name: "", ip: "")
+        updateWindowHeight()
+    }
 
     private func appendRow(name: String, ip: String) {
-        let nameField = makeField(placeholder: "Gerätename",  value: name)
-        let ipField   = makeField(placeholder: "10.0.0.x",   value: ip)
-        nameField.widthAnchor.constraint(equalToConstant: 160).isActive = true
+        let nameField = field(placeholder: "Gerätename", value: name)
+        let ipField   = field(placeholder: "10.0.0.x",  value: ip)
+        nameField.widthAnchor.constraint(equalToConstant: 180).isActive = true
         ipField  .widthAnchor.constraint(equalToConstant: 140).isActive = true
 
         let delBtn = NSButton(title: "−", target: self, action: #selector(deleteRow(_:)))
         delBtn.bezelStyle  = .rounded
-        delBtn.controlSize = .small
-        delBtn.widthAnchor.constraint(equalToConstant: 26).isActive = true
+        delBtn.controlSize = .regular
+        delBtn.widthAnchor.constraint(equalToConstant: 28).isActive = true
 
         let row = NSStackView(views: [nameField, ipField, delBtn])
-        row.spacing = 8
+        row.spacing   = 8
+        row.alignment = .centerY
 
-        rowData.append((row: row, nameField: nameField, ipField: ipField))
-        stackView.addArrangedSubview(row)
-        stackView.layoutSubtreeIfNeeded()
+        rows.append((name: nameField, ip: ipField))
+        outerStack.addArrangedSubview(row)
     }
 
     @objc private func deleteRow(_ sender: NSButton) {
         guard let row = sender.superview as? NSStackView else { return }
-        stackView.removeArrangedSubview(row)
+        // Passenden rows-Eintrag per Referenz finden
+        rows.removeAll { outerStack.arrangedSubviews.contains(row) && row.arrangedSubviews.contains($0.name) }
+        outerStack.removeArrangedSubview(row)
         row.removeFromSuperview()
-        rowData.removeAll { $0.row === row }
+        updateWindowHeight()
     }
 
     @objc private func saveTapped() {
-        let devices = rowData
-            .map { Device(name: $0.nameField.stringValue.trimmingCharacters(in: .whitespaces),
-                          ip:   $0.ipField  .stringValue.trimmingCharacters(in: .whitespaces)) }
-            .filter { !$0.ip.isEmpty && !$0.name.isEmpty }
+        let devices = rows
+            .map { Device(name: $0.name.stringValue.trimmingCharacters(in: .whitespaces),
+                          ip:   $0.ip  .stringValue.trimmingCharacters(in: .whitespaces)) }
+            .filter { !$0.name.isEmpty && !$0.ip.isEmpty }
         onSave(devices)
         window?.close()
     }
 
-    private func makeField(placeholder: String, value: String) -> NSTextField {
+    /// Fensterhöhe dynamisch an Zeilenanzahl anpassen
+    private func updateWindowHeight() {
+        guard let win = window else { return }
+        let rowCount  = CGFloat(rows.count + 1)   // +1 für Header
+        let rowHeight: CGFloat = 28
+        let spacing:   CGFloat = 8
+        let topPad:    CGFloat = 20
+        let bottomPad: CGFloat = 16 + 28 + 12     // Button-Bar + Abstand
+        let newH = topPad + rowCount * rowHeight + (rowCount - 1) * spacing + bottomPad + 12
+        var frame = win.frame
+        let delta = newH - frame.height
+        frame.origin.y -= delta
+        frame.size.height = newH
+        win.setFrame(frame, display: true, animate: false)
+    }
+
+    private func field(placeholder: String, value: String) -> NSTextField {
         let f = NSTextField(string: value)
         f.placeholderString = placeholder
-        f.controlSize = .regular
         return f
     }
 
-    private func columnHeader(_ text: String) -> NSTextField {
+    private func label(_ text: String, bold: Bool = false) -> NSTextField {
         let f = NSTextField(labelWithString: text)
-        f.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        f.font = NSFont.systemFont(ofSize: 12, weight: bold ? .semibold : .regular)
         f.textColor = .secondaryLabelColor
         return f
     }
