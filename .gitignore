@@ -1,0 +1,5 @@
+.build/
+*.o
+*.d
+ZendureBar.app/
+.DS_Store
