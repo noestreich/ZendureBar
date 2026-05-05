@@ -79,9 +79,26 @@ enum Prefs {
     }
 }
 
+// MARK: - MQTT Debug Logger
+
+private let mqttLogFile = "/tmp/zendurebar_mqtt.log"
+private func mqttLog(_ msg: String) {
+    let line = "\(Date()) \(msg)\n"
+    if let data = line.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: mqttLogFile) {
+            if let fh = FileHandle(forWritingAtPath: mqttLogFile) {
+                fh.seekToEndOfFile(); fh.write(data); fh.closeFile()
+            }
+        } else {
+            try? data.write(to: URL(fileURLWithPath: mqttLogFile))
+        }
+    }
+    print(msg)
+}
+
 // MARK: - MQTT Manager (Hyper 2000)
 
-final class HyperMQTTManager: CocoaMQTTDelegate {
+final class HyperMQTTManager: NSObject, CocoaMQTTDelegate {
 
     enum Status { case connecting, connected, disconnected, error(String) }
 
@@ -93,20 +110,23 @@ final class HyperMQTTManager: CocoaMQTTDelegate {
 
     init(config: MQTTConfig) {
         self.config = config
+        super.init()
+        mqttLog("[MQTT] Manager init – deviceID: \(config.deviceID), broker: \(config.broker)")
         connect()
     }
 
     private func connect() {
         onStatus?(.connecting)
-        let id = "ZendureBar-\(UUID().uuidString.prefix(8))"
-        let mqtt = CocoaMQTT(clientID: id, host: config.broker, port: 1883)
+        // Laut Zendure-Doku: clientID = appKey (nicht zufällig)
+        let mqtt = CocoaMQTT(clientID: config.appKey, host: config.broker, port: 1883)
         mqtt.username      = config.appKey
         mqtt.password      = config.appSecret
         mqtt.keepAlive     = 60
         mqtt.autoReconnect = true
         mqtt.autoReconnectTimeInterval = 10
         mqtt.delegate = self
-        _ = mqtt.connect()
+        let ok = mqtt.connect()
+        mqttLog("[MQTT] connect() → \(ok)")
         client = mqtt
     }
 
@@ -114,36 +134,103 @@ final class HyperMQTTManager: CocoaMQTTDelegate {
 
     // MARK: CocoaMQTTDelegate
 
+    // Periodischer Report-Request als Fallback (Gerät pusht bei Änderungen automatisch)
+    private var reportTimer: Timer?
+
     func mqtt(_ mqtt: CocoaMQTT, didConnectAck ack: CocoaMQTTConnAck) {
+        mqttLog("[MQTT] didConnectAck: \(ack.rawValue)")
         if ack == .accept {
             onStatus?(.connected)
-            mqtt.subscribe(config.stateTopic, qos: .qos0)
+            // Zendure-spezifische Topics abonnieren
+            let topics = [
+                "\(config.appKey)/#",
+                "\(config.appKey)/\(config.deviceID)/#",
+                "/\(config.appKey)/#",
+                "/\(config.appKey)/\(config.deviceID)/#",
+            ]
+            for t in topics { mqtt.subscribe(t, qos: .qos0) }
+            mqttLog("[MQTT] Subscribed to \(topics.count) topics")
+
+            // Report-Request: Gerät soll vollständigen State schicken
+            // Wird auch ohne expliziten Request bei Wertänderungen gesendet
+            sendReportRequest(mqtt)
+            reportTimer?.invalidate()
+            reportTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self, weak mqtt] _ in
+                guard let mqtt = mqtt else { return }
+                self?.sendReportRequest(mqtt)
+            }
         } else {
-            onStatus?(.error("MQTT Auth fehlgeschlagen (\(ack))"))
+            let msg: String
+            switch ack {
+            case .badUsernameOrPassword: msg = "Falscher App Key / Secret"
+            case .notAuthorized:         msg = "Nicht autorisiert"
+            case .serverUnavailable:     msg = "Server nicht verfügbar"
+            default:                     msg = "Code \(ack.rawValue)"
+            }
+            mqttLog("[MQTT] Verbindung abgelehnt: \(msg)")
+            onStatus?(.error(msg))
+        }
+    }
+
+    private func sendReportRequest(_ mqtt: CocoaMQTT) {
+        // Report-Request auf allen bekannten Topic-Varianten senden
+        let payload = #"{"properties":["getAll"]}"#
+        let readTopics = [
+            "iot/\(config.appKey)/\(config.deviceID)/properties/read",    // mit iot/-Prefix
+            "\(config.appKey)/\(config.deviceID)/properties/read",         // ohne iot/
+            "/\(config.appKey)/\(config.deviceID)/properties/read",        // mit führendem /
+        ]
+        for t in readTopics {
+            mqtt.publish(CocoaMQTTMessage(topic: t, string: payload, qos: .qos0))
+            mqttLog("[MQTT] Report-Request → \(t)")
         }
     }
 
     func mqtt(_ mqtt: CocoaMQTT, didReceiveMessage message: CocoaMQTTMessage, id: UInt16) {
-        guard let str  = message.string,
-              let data = str.data(using: .utf8),
+        guard let str = message.string else {
+            mqttLog("[MQTT] \(message.topic) – kein String-Payload")
+            return
+        }
+        mqttLog("[MQTT] Topic: \(message.topic)")
+        mqttLog("[MQTT] Payload: \(str)")
+
+        guard let data = str.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
 
-        let solar    = json["solarInputPower"]   as? Int ?? 0
-        let home     = json["outputHomePower"]   as? Int ?? 0
-        let battery  = json["electricLevel"]     as? Int ?? 0
-        let packIn   = json["packInputPower"]    as? Int ?? 0
-        let packOut  = json["outputPackPower"]   as? Int ?? 0
-        let gridIn   = json["gridInputPower"]    as? Int ?? 0
-        let remOut   = json["remainOutTime"]     as? Int ?? 0
-        let remIn    = json["remainInputTime"]   as? Int ?? 0
+        // Zendure wraps Werte unter "properties" (laut offizieller Doku)
+        let props: [String: Any] = (json["properties"] as? [String: Any]) ?? json
 
-        // Temperatur: Hyper 2000 kann rohe Celsius (z.B. 29.5) oder Zendure-kodiert (z.B. 3031) liefern
-        let rawTmp   = json["hyperTmp"] as? Double ?? 0
+        let solar    = props["solarInputPower"]   as? Int ?? 0
+        let home     = props["outputHomePower"]   as? Int ?? 0
+        let battery  = props["electricLevel"]     as? Int ?? 0
+        let packIn   = props["packInputPower"]    as? Int ?? 0
+        let packOut  = props["outputPackPower"]   as? Int ?? 0
+        let gridIn   = props["gridInputPower"]    as? Int ?? 0
+        let remOut   = props["remainOutTime"]     as? Int ?? 0
+        let remIn    = props["remainInputTime"]   as? Int ?? 0
+
+        // hyperTmp kommt als Int (Celsius, nicht Zendure-kodiert laut Hyper 2000 Doku)
+        let rawTmp   = (props["hyperTmp"] as? Double) ?? Double(props["hyperTmp"] as? Int ?? 0)
         let tempC    = rawTmp > 200 ? (rawTmp - 2731) / 10.0 : rawTmp
 
         let channels = (1...4).compactMap { i -> Int? in
-            let w = json["solarPower\(i)"] as? Int ?? 0; return w > 0 ? w : nil
+            let w = props["solarPower\(i)"] as? Int ?? 0; return w > 0 ? w : nil
+        }
+
+        // packData: Array mit Batterie-Pack-Details
+        let packs: [BatteryPack] = (json["packData"] as? [[String: Any]] ?? []).map { p in
+            let soc  = p["socLevel"]  as? Int    ?? 0
+            let tmp  = p["maxTemp"]   as? Double ?? Double(p["maxTemp"] as? Int ?? 0)
+            let maxV = p["maxVol"]    as? Double ?? 0
+            let minV = p["minVol"]    as? Double ?? 0
+            return BatteryPack(socLevel: soc, tempCelsius: tmp, voltageV: maxV, state: 0)
+        }
+
+        // Nachrichten ohne nutzbare Daten ignorieren (z.B. leere Teilupdates)
+        guard solar > 0 || battery > 0 || packIn > 0 || packOut > 0 || !packs.isEmpty else {
+            mqttLog("[MQTT] Keine relevanten Werte – übersprungen")
+            return
         }
 
         let result = DeviceData(
@@ -152,19 +239,24 @@ final class HyperMQTTManager: CocoaMQTTDelegate {
             homeOutput: home, batteryLevel: battery,
             batteryCharge: packIn, batteryDischarge: packOut, gridInput: gridIn,
             remainSeconds: packOut > 0 ? remOut : (packIn > 0 ? remIn : 0),
-            deviceTempC: tempC, packs: [], rssi: 0
+            deviceTempC: tempC, packs: packs, rssi: 0
         )
         DispatchQueue.main.async { [weak self] in self?.onData?(result) }
     }
 
     func mqttDidDisconnect(_ mqtt: CocoaMQTT, withError err: Error?) {
+        mqttLog("[MQTT] Disconnect: \(err?.localizedDescription ?? "–")")
+        reportTimer?.invalidate()
+        reportTimer = nil
         onStatus?(.disconnected)
     }
 
     // Pflicht-Stubs
     func mqtt(_ mqtt: CocoaMQTT, didPublishMessage message: CocoaMQTTMessage, id: UInt16) {}
     func mqtt(_ mqtt: CocoaMQTT, didPublishAck id: UInt16) {}
-    func mqtt(_ mqtt: CocoaMQTT, didSubscribeTopics success: NSDictionary, failed: [String]) {}
+    func mqtt(_ mqtt: CocoaMQTT, didSubscribeTopics success: NSDictionary, failed: [String]) {
+        mqttLog("[MQTT] Subscribed OK: \(success.allKeys), failed: \(failed)")
+    }
     func mqtt(_ mqtt: CocoaMQTT, didUnsubscribeTopics topics: [String]) {}
     func mqttDidPing(_ mqtt: CocoaMQTT) {}
     func mqttDidReceivePong(_ mqtt: CocoaMQTT) {}
