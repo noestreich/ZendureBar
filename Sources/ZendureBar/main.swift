@@ -1,22 +1,26 @@
 import AppKit
 import Foundation
 import CocoaMQTT
+import CommonCrypto
+import SQLite3
 
 // MARK: - Modelle
 
-struct Device: Codable {
-    var name: String
-    var ip: String
+// Gerät aus der /api/ha/deviceList Antwort
+struct CloudDevice {
+    var name:       String
+    var productKey: String
+    var deviceKey:  String
+    var snNumber:   String
+    var ip:         String
 }
 
-struct MQTTConfig: Codable {
-    var appKey:   String
-    var appSecret: String
-    var deviceID: String
+// MQTT-Zugangsdaten aus der API
+struct MQTTCredentials {
     var broker:   String
-
-    var isValid: Bool { !appKey.isEmpty && !appSecret.isEmpty && !deviceID.isEmpty && !broker.isEmpty }
-    var stateTopic: String { "\(appKey)/\(deviceID)/state" }
+    var username: String
+    var password: String
+    var clientId: String
 }
 
 struct BatteryPack {
@@ -47,35 +51,177 @@ struct ShellMeterData {
     let voltageA: Double; let voltageB: Double; let voltageC: Double
 }
 
+// MARK: - Persistente Daten (SQLite)
+
+final class DataStore {
+    static let shared = DataStore()
+
+    private var db:         OpaquePointer?
+    private var lastInsert: Date = .distantPast
+
+    private init() {
+        guard let support = FileManager.default
+                .urls(for: .applicationSupportDirectory, in: .userDomainMask).first else { return }
+        let dir = support.appendingPathComponent("ZendureBar")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let path = dir.appendingPathComponent("history.sqlite").path
+        sqlite3_open(path, &db)
+        exec("""
+            CREATE TABLE IF NOT EXISTS readings (
+                ts      INTEGER PRIMARY KEY,
+                solar_w INTEGER NOT NULL DEFAULT 0,
+                grid_w  INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        // Einträge älter als 90 Tage automatisch löschen
+        let cutoff = Int(Date().timeIntervalSince1970) - 90 * 86400
+        exec("DELETE FROM readings WHERE ts < \(cutoff)")
+        mqttLog("[DB] Geöffnet: \(path)")
+    }
+
+    @discardableResult
+    private func exec(_ sql: String) -> Bool {
+        sqlite3_exec(db, sql, nil, nil, nil) == SQLITE_OK
+    }
+
+    /// Speichert einen Messpunkt – maximal 1× alle 10 Sekunden
+    func insert(solar: Int, grid: Int) {
+        guard Date().timeIntervalSince(lastInsert) >= 10 else { return }
+        lastInsert = Date()
+        let ts = Int(Date().timeIntervalSince1970)
+        exec("INSERT OR REPLACE INTO readings(ts,solar_w,grid_w) VALUES(\(ts),\(solar),\(grid))")
+    }
+
+    /// Liest einen Zeitbereich, auf maxPoints heruntergesampelt
+    func query(from: Date, to: Date, maxPoints: Int = 500)
+        -> (solar: [(time: Date, watts: Int)], grid: [(time: Date, watts: Int)])
+    {
+        let sql = """
+            SELECT ts,solar_w,grid_w FROM readings
+            WHERE ts >= \(Int(from.timeIntervalSince1970))
+              AND ts <= \(Int(to.timeIntervalSince1970))
+            ORDER BY ts
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return ([], []) }
+        defer { sqlite3_finalize(stmt) }
+        var rows: [(ts: Int, s: Int, g: Int)] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            rows.append((
+                Int(sqlite3_column_int64(stmt, 0)),
+                Int(sqlite3_column_int(stmt, 1)),
+                Int(sqlite3_column_int(stmt, 2))
+            ))
+        }
+        let step    = max(1, rows.count / maxPoints)
+        let sampled = Swift.stride(from: 0, to: rows.count, by: step).map { rows[$0] }
+        return (
+            solar: sampled.map { (time: Date(timeIntervalSince1970: Double($0.ts)), watts: $0.s) },
+            grid:  sampled.map { (time: Date(timeIntervalSince1970: Double($0.ts)), watts: $0.g) }
+        )
+    }
+
+    /// Heutiger Tag von Mitternacht bis jetzt
+    func todayData() -> (solar: [(time: Date, watts: Int)], grid: [(time: Date, watts: Int)]) {
+        query(from: Calendar.current.startOfDay(for: Date()), to: Date())
+    }
+}
+
 // MARK: - UserDefaults
 
 enum Prefs {
-    static let devicesKey    = "ZendureDevices"
-    static let meterIPKey    = "ShellyMeterIP"
-    static let mqttConfigKey = "ZendureMQTTConfig"
+    static let meterIPKey  = "ShellyMeterIP"
+    static let cloudKeyKey = "ZendureCloudKey"
 
-    static func loadDevices() -> [Device] {
-        guard let d = UserDefaults.standard.data(forKey: devicesKey),
-              let v = try? JSONDecoder().decode([Device].self, from: d) else { return [] }
-        return v
-    }
-    static func save(devices: [Device]) {
-        if let d = try? JSONEncoder().encode(devices) { UserDefaults.standard.set(d, forKey: devicesKey) }
-    }
-    static func loadMeterIP() -> String { UserDefaults.standard.string(forKey: meterIPKey) ?? "" }
-    static func save(meterIP: String) { UserDefaults.standard.set(meterIP, forKey: meterIPKey) }
+    static func loadMeterIP() -> String  { UserDefaults.standard.string(forKey: meterIPKey)  ?? "" }
+    static func save(meterIP: String)    { UserDefaults.standard.set(meterIP,  forKey: meterIPKey) }
 
-    static func loadMQTTConfig() -> MQTTConfig? {
-        guard let d = UserDefaults.standard.data(forKey: mqttConfigKey),
-              let v = try? JSONDecoder().decode(MQTTConfig.self, from: d) else { return nil }
-        return v
+    static func loadCloudKey() -> String { UserDefaults.standard.string(forKey: cloudKeyKey) ?? "" }
+    static func save(cloudKey: String) {
+        if cloudKey.isEmpty { UserDefaults.standard.removeObject(forKey: cloudKeyKey) }
+        else                { UserDefaults.standard.set(cloudKey, forKey: cloudKeyKey) }
     }
-    static func save(mqttConfig: MQTTConfig?) {
-        if let cfg = mqttConfig, let d = try? JSONEncoder().encode(cfg) {
-            UserDefaults.standard.set(d, forKey: mqttConfigKey)
-        } else {
-            UserDefaults.standard.removeObject(forKey: mqttConfigKey)
+}
+
+// MARK: - Zendure Cloud API
+
+enum ZendureAPI {
+    private static let haKey = "C*dafwArEOXK"
+
+    static func decode(cloudKey: String) -> (apiUrl: String, appKey: String)? {
+        guard let data = Data(base64Encoded: cloudKey),
+              let decoded = String(data: data, encoding: .utf8) else { return nil }
+        let parts = decoded.components(separatedBy: ".")
+        guard parts.count >= 2 else { return nil }
+        return (parts.dropLast().joined(separator: "."), parts.last!)
+    }
+
+    static func fetchDeviceList(cloudKey: String,
+                                completion: @escaping (MQTTCredentials?, [CloudDevice]) -> Void) {
+        guard let (apiUrl, appKey) = decode(cloudKey: cloudKey),
+              let url = URL(string: "\(apiUrl)/api/ha/deviceList") else {
+            completion(nil, []); return
         }
+        let timestamp = Int(Date().timeIntervalSince1970)
+        let nonce     = String(Int.random(in: 10000...99999))
+        let body      = ["appKey": appKey]
+        let signParts = body.merging(["timestamp": String(timestamp), "nonce": nonce]) { $1 }
+        let bodyStr   = signParts.sorted { $0.key < $1.key }.map { "\($0.key)\($0.value)" }.joined()
+        let sha1      = "\(haKey)\(bodyStr)\(haKey)".data(using: .utf8)!.sha1().uppercased()
+
+        var req = URLRequest(url: url)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue(String(timestamp),  forHTTPHeaderField: "timestamp")
+        req.setValue(nonce,              forHTTPHeaderField: "nonce")
+        req.setValue("zenHa",            forHTTPHeaderField: "clientid")
+        req.setValue(sha1,               forHTTPHeaderField: "sign")
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+
+        URLSession.shared.dataTask(with: req) { data, _, _ in
+            guard let data,
+                  let json    = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let resData = json["data"] as? [String: Any] else {
+                mqttLog("[API] Ungültige Antwort")
+                DispatchQueue.main.async { completion(nil, []) }; return
+            }
+            mqttLog("[API] Antwort: \(json)")
+            var creds: MQTTCredentials?
+            if let mqttInfo = resData["mqtt"] as? [String: Any],
+               let brokerRaw = mqttInfo["url"] as? String, !brokerRaw.isEmpty {
+                let broker = brokerRaw.components(separatedBy: ":").first ?? brokerRaw
+                creds = MQTTCredentials(
+                    broker:   broker,
+                    username: mqttInfo["username"] as? String ?? "",
+                    password: mqttInfo["password"] as? String ?? "",
+                    clientId: mqttInfo["clientId"] as? String ?? appKey)
+                mqttLog("[API] Broker: \(broker), User: \(creds!.username)")
+            }
+            let devList = (resData["deviceList"] as? [[String: Any]] ?? []).compactMap { d -> CloudDevice? in
+                guard let pk = d["productKey"] as? String, !pk.isEmpty,
+                      let dk = d["deviceKey"]  as? String, !dk.isEmpty else { return nil }
+                return CloudDevice(
+                    name:       d["deviceName"]  as? String ?? d["productModel"] as? String ?? "Zendure",
+                    productKey: pk, deviceKey: dk,
+                    snNumber:   d["snNumber"]    as? String ?? "",
+                    ip:         d["ip"]          as? String ?? "")
+            }
+            mqttLog("[API] Geräte: \(devList.map { "\($0.name) (\($0.deviceKey))" })")
+            DispatchQueue.main.async { completion(creds, devList) }
+        }.resume()
+    }
+}
+
+private extension Data {
+    func sha1() -> String {
+        var digest = [UInt8](repeating: 0, count: Int(CC_SHA1_DIGEST_LENGTH))
+        withUnsafeBytes { ptr in
+            var ctx = CC_SHA1_CTX()
+            CC_SHA1_Init(&ctx)
+            CC_SHA1_Update(&ctx, ptr.baseAddress, CC_LONG(count))
+            CC_SHA1_Final(&digest, &ctx)
+        }
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -89,173 +235,238 @@ private func mqttLog(_ msg: String) {
             if let fh = FileHandle(forWritingAtPath: mqttLogFile) {
                 fh.seekToEndOfFile(); fh.write(data); fh.closeFile()
             }
-        } else {
-            try? data.write(to: URL(fileURLWithPath: mqttLogFile))
-        }
+        } else { try? data.write(to: URL(fileURLWithPath: mqttLogFile)) }
     }
     print(msg)
 }
 
-// MARK: - MQTT Manager (Hyper 2000)
+// MARK: - MQTT Manager
 
-final class HyperMQTTManager: NSObject, CocoaMQTTDelegate {
+final class ZendureMQTTManager: NSObject, CocoaMQTTDelegate {
 
     enum Status { case connecting, connected, disconnected, error(String) }
 
     var onData:   ((DeviceData) -> Void)?
     var onStatus: ((Status) -> Void)?
 
-    private var client: CocoaMQTT?
-    private let config: MQTTConfig
+    private var client:  CocoaMQTT?
+    private let creds:   MQTTCredentials
+    private let devices: [CloudDevice]
 
-    init(config: MQTTConfig) {
-        self.config = config
+    // Akkumulierter State je deviceKey (Zendure schickt partielle Updates)
+    private var accProps: [String: [String: Any]]   = [:]
+    private var accPacks: [String: [[String: Any]]] = [:]
+
+    // Watchdog & periodischer getAll-Request
+    private var getAllTimer:      Timer?
+    private var watchdogTimer:    Timer?
+    private var lastDataReceived: Date?
+    private var connectedAt:      Date?
+    private var isConnected = false
+
+    init(credentials: MQTTCredentials, devices: [CloudDevice]) {
+        self.creds   = credentials
+        self.devices = devices
         super.init()
-        mqttLog("[MQTT] Manager init – deviceID: \(config.deviceID), broker: \(config.broker)")
+        mqttLog("[MQTT] Init – Broker: \(credentials.broker), Geräte: \(devices.map { $0.name })")
         connect()
+        startWatchdog()
     }
 
     private func connect() {
         onStatus?(.connecting)
-        // Laut Zendure-Doku: clientID = appKey (nicht zufällig)
-        let mqtt = CocoaMQTT(clientID: config.appKey, host: config.broker, port: 1883)
-        mqtt.username      = config.appKey
-        mqtt.password      = config.appSecret
+        let mqtt = CocoaMQTT(clientID: creds.clientId, host: creds.broker, port: 1883)
+        mqtt.username      = creds.username
+        mqtt.password      = creds.password
         mqtt.keepAlive     = 60
         mqtt.autoReconnect = true
-        mqtt.autoReconnectTimeInterval = 10
+        mqtt.autoReconnectTimeInterval = 15
         mqtt.delegate = self
-        let ok = mqtt.connect()
-        mqttLog("[MQTT] connect() → \(ok)")
+        mqttLog("[MQTT] connect() → \(mqtt.connect())")
         client = mqtt
     }
 
-    func disconnect() { client?.disconnect(); client = nil }
+    func disconnect() {
+        getAllTimer?.invalidate();   getAllTimer   = nil
+        watchdogTimer?.invalidate(); watchdogTimer = nil
+        client?.disconnect(); client = nil
+    }
+
+    // MARK: - Watchdog
+
+    private func startWatchdog() {
+        watchdogTimer?.invalidate()
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            self?.watchdogTick()
+        }
+    }
+
+    private func watchdogTick() {
+        guard isConnected else { return }
+
+        // Wie lange verbunden?
+        let connAge = connectedAt.map { -$0.timeIntervalSinceNow } ?? 0
+        // Wie lange keine Daten?
+        let dataAge: Double
+        if let last = lastDataReceived { dataAge = -last.timeIntervalSinceNow }
+        else { dataAge = connAge }   // noch nie Daten → Alter = Verbindungsalter
+        mqttLog("[Watchdog] Verbunden \(Int(connAge)) s, letzte Daten vor \(Int(dataAge)) s")
+
+        // Erst nach 5 Minuten ohne Daten reconnecten – so haben langsam startende
+        // Geräte genug Zeit um sich beim Broker einzuloggen
+        if dataAge > 300 {
+            mqttLog("[Watchdog] 5 min keine Daten – Reconnect")
+            getAllTimer?.invalidate(); getAllTimer = nil
+            isConnected = false
+            connectedAt = nil
+            client?.disconnect()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.connect()
+            }
+        }
+    }
+
+    // MARK: - getAll Hilfsfunktion
+
+    private func sendGetAll() {
+        guard let mqtt = client, isConnected else { return }
+        let payload = #"{"properties":["getAll"]}"#
+        for dev in devices {
+            let readTopic = "/\(dev.productKey)/\(dev.deviceKey)/properties/read"
+            mqtt.publish(CocoaMQTTMessage(topic: readTopic, string: payload, qos: .qos0))
+            mqttLog("[MQTT] getAll → \(readTopic)")
+        }
+    }
 
     // MARK: CocoaMQTTDelegate
 
-    // Periodischer Report-Request als Fallback (Gerät pusht bei Änderungen automatisch)
-    private var reportTimer: Timer?
-
     func mqtt(_ mqtt: CocoaMQTT, didConnectAck ack: CocoaMQTTConnAck) {
-        mqttLog("[MQTT] didConnectAck: \(ack.rawValue)")
-        if ack == .accept {
-            onStatus?(.connected)
-            // Zendure-spezifische Topics abonnieren
-            let topics = [
-                "\(config.appKey)/#",
-                "\(config.appKey)/\(config.deviceID)/#",
-                "/\(config.appKey)/#",
-                "/\(config.appKey)/\(config.deviceID)/#",
-            ]
-            for t in topics { mqtt.subscribe(t, qos: .qos0) }
-            mqttLog("[MQTT] Subscribed to \(topics.count) topics")
-
-            // Report-Request: Gerät soll vollständigen State schicken
-            // Wird auch ohne expliziten Request bei Wertänderungen gesendet
-            sendReportRequest(mqtt)
-            reportTimer?.invalidate()
-            reportTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self, weak mqtt] _ in
-                guard let mqtt = mqtt else { return }
-                self?.sendReportRequest(mqtt)
-            }
-        } else {
+        mqttLog("[MQTT] ConnAck: \(ack.rawValue)")
+        guard ack == .accept else {
             let msg: String
             switch ack {
-            case .badUsernameOrPassword: msg = "Falscher App Key / Secret"
+            case .badUsernameOrPassword: msg = "Falscher Nutzer / Passwort"
             case .notAuthorized:         msg = "Nicht autorisiert"
             case .serverUnavailable:     msg = "Server nicht verfügbar"
             default:                     msg = "Code \(ack.rawValue)"
             }
-            mqttLog("[MQTT] Verbindung abgelehnt: \(msg)")
-            onStatus?(.error(msg))
+            mqttLog("[MQTT] Abgelehnt: \(msg)"); onStatus?(.error(msg)); return
         }
-    }
+        isConnected = true
+        connectedAt = Date()
+        onStatus?(.connected)
 
-    private func sendReportRequest(_ mqtt: CocoaMQTT) {
-        // Report-Request auf allen bekannten Topic-Varianten senden
-        let payload = #"{"properties":["getAll"]}"#
-        let readTopics = [
-            "iot/\(config.appKey)/\(config.deviceID)/properties/read",    // mit iot/-Prefix
-            "\(config.appKey)/\(config.deviceID)/properties/read",         // ohne iot/
-            "/\(config.appKey)/\(config.deviceID)/properties/read",        // mit führendem /
-        ]
-        for t in readTopics {
-            mqtt.publish(CocoaMQTTMessage(topic: t, string: payload, qos: .qos0))
-            mqttLog("[MQTT] Report-Request → \(t)")
+        // Topic-Format: /{productKey}/{deviceKey}/# (führender Slash!)
+        for dev in devices {
+            let t = "/\(dev.productKey)/\(dev.deviceKey)/#"
+            mqtt.subscribe(t, qos: .qos0)
+            mqttLog("[MQTT] Subscribe: \(t)")
+        }
+
+        // Ersten getAll nach kurzer Pause senden, dann alle 60 s wiederholen.
+        // Das stellt sicher, dass Geräte die nach dem Mac-Start langsam online kamen
+        // trotzdem innerhalb einer Minute antworten.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.sendGetAll()
+            self?.getAllTimer?.invalidate()
+            self?.getAllTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+                self?.sendGetAll()
+            }
         }
     }
 
     func mqtt(_ mqtt: CocoaMQTT, didReceiveMessage message: CocoaMQTTMessage, id: UInt16) {
-        guard let str = message.string else {
-            mqttLog("[MQTT] \(message.topic) – kein String-Payload")
-            return
-        }
-        mqttLog("[MQTT] Topic: \(message.topic)")
-        mqttLog("[MQTT] Payload: \(str)")
+        guard let str = message.string else { return }
+        let topic = message.topic
+        mqttLog("[MQTT] \(topic): \(str)")
 
-        guard let data = str.data(using: .utf8),
+        guard topic.hasSuffix("properties/report"),
+              let data = str.data(using: .utf8),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
 
-        // Zendure wraps Werte unter "properties" (laut offizieller Doku)
-        let props: [String: Any] = (json["properties"] as? [String: Any]) ?? json
+        // deviceKey aus Topic: /{productKey}/{deviceKey}/...
+        let parts = topic.split(separator: "/", omittingEmptySubsequences: true)
+        guard parts.count >= 2 else { return }
+        let deviceKey = String(parts[1])
+        guard let cloudDev = devices.first(where: { $0.deviceKey == deviceKey }) else { return }
 
-        let solar    = props["solarInputPower"]   as? Int ?? 0
-        let home     = props["outputHomePower"]   as? Int ?? 0
-        let battery  = props["electricLevel"]     as? Int ?? 0
-        let packIn   = props["packInputPower"]    as? Int ?? 0
-        let packOut  = props["outputPackPower"]   as? Int ?? 0
-        let gridIn   = props["gridInputPower"]    as? Int ?? 0
-        let remOut   = props["remainOutTime"]     as? Int ?? 0
-        let remIn    = props["remainInputTime"]   as? Int ?? 0
+        // Zendure schickt Werte flat im Payload (kein "properties"-Wrapper) –
+        // aber manchmal auch gewrappt; beide Varianten unterstützen
+        let incoming: [String: Any]
+        if let wrapped = json["properties"] as? [String: Any] {
+            incoming = wrapped
+        } else {
+            incoming = json.filter { $0.key != "packData" }
+        }
+        if !incoming.isEmpty {
+            // WICHTIG: explizite Kopie nötig – Swift Dicts sind Value Types.
+            // accProps[key]![subkey] = v würde eine Kopie modifizieren, nicht das Original.
+            var current = accProps[deviceKey] ?? [:]
+            for (k, v) in incoming { current[k] = v }
+            accProps[deviceKey] = current
+        }
+        if let packs = json["packData"] as? [[String: Any]], !packs.isEmpty {
+            // Vollständige Daten (socLevel/maxTemp) bevorzugen; minimale Daten nur als Fallback
+            let hasFullData = packs.first.flatMap { $0["socLevel"] } != nil
+            if hasFullData || accPacks[deviceKey] == nil {
+                accPacks[deviceKey] = packs
+            }
+        }
 
-        // hyperTmp kommt als Int (Celsius, nicht Zendure-kodiert laut Hyper 2000 Doku)
-        let rawTmp   = (props["hyperTmp"] as? Double) ?? Double(props["hyperTmp"] as? Int ?? 0)
-        let tempC    = rawTmp > 200 ? (rawTmp - 2731) / 10.0 : rawTmp
+        let props = accProps[deviceKey] ?? [:]
+        let packs = accPacks[deviceKey] ?? []
+
+        let solar   = props["solarInputPower"]  as? Int ?? 0
+        let battery = props["electricLevel"]    as? Int ?? 0
+        let packIn  = props["packInputPower"]   as? Int ?? 0
+        let packOut = props["outputPackPower"]  as? Int ?? 0
+        guard solar > 0 || battery > 0 || packIn > 0 || packOut > 0 || !packs.isEmpty else { return }
+
+        let home   = props["outputHomePower"]  as? Int ?? 0
+        let gridIn = props["gridInputPower"]   as? Int ?? 0
+        let remOut = props["remainOutTime"]    as? Int ?? 0
+        let remIn  = props["remainInputTime"]  as? Int ?? 0
+
+        // Temperatur: Zendure-Kodierung → (rawValue − 2731) / 10 = °C
+        let rawTmp = (props["hyperTmp"] as? Double) ?? Double(props["hyperTmp"] as? Int ?? 0)
+        let tempC  = rawTmp > 200 ? (rawTmp - 2731) / 10.0 : rawTmp
 
         let channels = (1...4).compactMap { i -> Int? in
             let w = props["solarPower\(i)"] as? Int ?? 0; return w > 0 ? w : nil
         }
-
-        // packData: Array mit Batterie-Pack-Details
-        let packs: [BatteryPack] = (json["packData"] as? [[String: Any]] ?? []).map { p in
-            let soc  = p["socLevel"]  as? Int    ?? 0
-            let tmp  = p["maxTemp"]   as? Double ?? Double(p["maxTemp"] as? Int ?? 0)
-            let maxV = p["maxVol"]    as? Double ?? 0
-            let minV = p["minVol"]    as? Double ?? 0
-            return BatteryPack(socLevel: soc, tempCelsius: tmp, voltageV: maxV, state: 0)
-        }
-
-        // Nachrichten ohne nutzbare Daten ignorieren (z.B. leere Teilupdates)
-        guard solar > 0 || battery > 0 || packIn > 0 || packOut > 0 || !packs.isEmpty else {
-            mqttLog("[MQTT] Keine relevanten Werte – übersprungen")
-            return
+        let battPacks: [BatteryPack] = packs.map { p in
+            let rawT = (p["maxTemp"] as? Double) ?? Double(p["maxTemp"] as? Int ?? 0)
+            let tmp  = rawT > 200 ? (rawT - 2731) / 10.0 : rawT
+            let rawV = p["totalVol"] as? Int ?? 0
+            return BatteryPack(
+                socLevel:    p["socLevel"] as? Int ?? 0,
+                tempCelsius: tmp,
+                voltageV:    Double(rawV) / 100.0,
+                state:       p["state"]   as? Int ?? 0)
         }
 
         let result = DeviceData(
-            name: "Hyper 2000",
-            solarPower: solar, solarChannels: channels,
-            homeOutput: home, batteryLevel: battery,
-            batteryCharge: packIn, batteryDischarge: packOut, gridInput: gridIn,
+            name: cloudDev.name, solarPower: solar, solarChannels: channels,
+            homeOutput: home, batteryLevel: battery, batteryCharge: packIn,
+            batteryDischarge: packOut, gridInput: gridIn,
             remainSeconds: packOut > 0 ? remOut : (packIn > 0 ? remIn : 0),
-            deviceTempC: tempC, packs: packs, rssi: 0
-        )
+            deviceTempC: tempC, packs: battPacks, rssi: props["rssi"] as? Int ?? 0)
+        lastDataReceived = Date()
         DispatchQueue.main.async { [weak self] in self?.onData?(result) }
     }
 
     func mqttDidDisconnect(_ mqtt: CocoaMQTT, withError err: Error?) {
         mqttLog("[MQTT] Disconnect: \(err?.localizedDescription ?? "–")")
-        reportTimer?.invalidate()
-        reportTimer = nil
+        isConnected = false
+        getAllTimer?.invalidate(); getAllTimer = nil
         onStatus?(.disconnected)
     }
 
-    // Pflicht-Stubs
     func mqtt(_ mqtt: CocoaMQTT, didPublishMessage message: CocoaMQTTMessage, id: UInt16) {}
     func mqtt(_ mqtt: CocoaMQTT, didPublishAck id: UInt16) {}
     func mqtt(_ mqtt: CocoaMQTT, didSubscribeTopics success: NSDictionary, failed: [String]) {
-        mqttLog("[MQTT] Subscribed OK: \(success.allKeys), failed: \(failed)")
+        mqttLog("[MQTT] Subscribe OK: \(success.allKeys), failed: \(failed)")
     }
     func mqtt(_ mqtt: CocoaMQTT, didUnsubscribeTopics topics: [String]) {}
     func mqttDidPing(_ mqtt: CocoaMQTT) {}
@@ -266,81 +477,48 @@ final class HyperMQTTManager: NSObject, CocoaMQTTDelegate {
 
 final class SettingsWindowController: NSWindowController {
 
-    private var rows: [(name: NSTextField, ip: NSTextField)] = []
     private let outerStack = NSStackView()
+    private var meterField    = NSTextField()
+    private var cloudKeyField = NSTextField()
 
-    // Smart Meter
-    private var meterField = NSTextField()
+    var onSave: (String, String) -> Void = { _, _ in }
 
-    // MQTT
-    private var mqttKeyField      = NSTextField()
-    private var mqttSecretField   = NSTextField()
-    private var mqttDeviceField   = NSTextField()
-    private var mqttBrokerField   = NSTextField()
-
-    var onSave: ([Device], String, MQTTConfig?) -> Void = { _, _, _ in }
-
-    init(devices: [Device], meterIP: String, mqttConfig: MQTTConfig?) {
+    init(meterIP: String, cloudKey: String) {
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 420, height: 200),
+            contentRect: NSRect(x: 0, y: 0, width: 440, height: 160),
             styleMask: [.titled, .closable],
-            backing: .buffered,
-            defer: false
-        )
+            backing: .buffered, defer: false)
         win.title = "Einstellungen"
         win.isReleasedWhenClosed = false
         super.init(window: win)
-        buildUI(devices: devices, meterIP: meterIP, mqttConfig: mqttConfig)
+        buildUI(meterIP: meterIP, cloudKey: cloudKey)
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    private func buildUI(devices: [Device], meterIP: String, mqttConfig: MQTTConfig?) {
+    private func buildUI(meterIP: String, cloudKey: String) {
         guard let cv = window?.contentView else { return }
 
         outerStack.orientation = .vertical
         outerStack.alignment   = .left
-        outerStack.spacing     = 8
+        outerStack.spacing     = 10
         outerStack.translatesAutoresizingMaskIntoConstraints = false
         cv.addSubview(outerStack)
 
-        // ── Zendure Geräte ───────────────────────────────────────────────
-        outerStack.addArrangedSubview(sectionLabel("Zendure Geräte"))
-        outerStack.addArrangedSubview(deviceHeaderRow())
-        for d in devices { appendDeviceRow(name: d.name, ip: d.ip) }
-        let addBtn = NSButton(title: "+ Gerät hinzufügen", target: self, action: #selector(addRowTapped))
-        addBtn.bezelStyle = .rounded; addBtn.controlSize = .small
-        outerStack.addArrangedSubview(addBtn)
+        // ── Zendure Cloud Key ────────────────────────────────────────────
+        outerStack.addArrangedSubview(sectionLabel("Zendure Cloud Key"))
+        let hint = NSTextField(labelWithString: "Zendure App → Profil → API → Cloud Key")
+        hint.font = NSFont.systemFont(ofSize: 10); hint.textColor = .tertiaryLabelColor
+        outerStack.addArrangedSubview(hint)
+        cloudKeyField = field(placeholder: "aHR0cH…  (base64-Token aus der App)", value: cloudKey)
+        cloudKeyField.widthAnchor.constraint(equalToConstant: 400).isActive = true
+        outerStack.addArrangedSubview(cloudKeyField)
 
         // ── Smart Meter ──────────────────────────────────────────────────
         outerStack.addArrangedSubview(divider())
         outerStack.addArrangedSubview(sectionLabel("Smart Meter (Shelly Pro 3EM)"))
         meterField = field(placeholder: "10.0.0.x  —  leer lassen wenn nicht vorhanden", value: meterIP)
-        meterField.widthAnchor.constraint(equalToConstant: 360).isActive = true
+        meterField.widthAnchor.constraint(equalToConstant: 400).isActive = true
         outerStack.addArrangedSubview(meterField)
-
-        // ── MQTT / Hyper 2000 ────────────────────────────────────────────
-        outerStack.addArrangedSubview(divider())
-        outerStack.addArrangedSubview(sectionLabel("MQTT — Hyper 2000"))
-
-        let hint = NSTextField(labelWithString: "App Key + Secret: zendure.com/developer → API beantragen")
-        hint.font = NSFont.systemFont(ofSize: 10); hint.textColor = .tertiaryLabelColor
-        outerStack.addArrangedSubview(hint)
-
-        let mqttRows: [(String, NSTextField, String, String)] = [
-            ("App Key",     mqttKeyField,    "appKey",            mqttConfig?.appKey    ?? ""),
-            ("App Secret",  mqttSecretField, "appSecret",         mqttConfig?.appSecret ?? ""),
-            ("Seriennummer",mqttDeviceField, "Hyper 2000 DeviceID", mqttConfig?.deviceID ?? ""),
-            ("Broker",      mqttBrokerField, "mqtt-eu.zen-iot.com", mqttConfig?.broker  ?? "mqtt-eu.zen-iot.com"),
-        ]
-        for (labelText, textField, placeholder, value) in mqttRows {
-            textField.stringValue      = value
-            textField.placeholderString = placeholder
-            let lbl = label(labelText)
-            lbl.widthAnchor.constraint(equalToConstant: 100).isActive = true
-            textField.widthAnchor.constraint(equalToConstant: 255).isActive = true
-            let row = NSStackView(views: [lbl, textField]); row.spacing = 8
-            outerStack.addArrangedSubview(row)
-        }
 
         // ── Speichern ────────────────────────────────────────────────────
         let saveBtn = NSButton(title: "Speichern", target: self, action: #selector(saveTapped))
@@ -351,103 +529,209 @@ final class SettingsWindowController: NSWindowController {
         cv.addSubview(bottomBar)
 
         NSLayoutConstraint.activate([
-            outerStack.topAnchor    .constraint(equalTo: cv.topAnchor,       constant:  20),
-            outerStack.leadingAnchor.constraint(equalTo: cv.leadingAnchor,   constant:  20),
-            outerStack.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -20),
+            outerStack.topAnchor    .constraint(equalTo: cv.topAnchor,      constant:  20),
+            outerStack.leadingAnchor.constraint(equalTo: cv.leadingAnchor,  constant:  20),
+            outerStack.trailingAnchor.constraint(equalTo: cv.trailingAnchor,constant: -20),
             outerStack.bottomAnchor .constraint(lessThanOrEqualTo: bottomBar.topAnchor, constant: -12),
-            bottomBar.leadingAnchor .constraint(equalTo: cv.leadingAnchor,   constant:  20),
-            bottomBar.trailingAnchor.constraint(equalTo: cv.trailingAnchor,  constant: -20),
-            bottomBar.bottomAnchor  .constraint(equalTo: cv.bottomAnchor,    constant: -16),
+            bottomBar.leadingAnchor .constraint(equalTo: cv.leadingAnchor,  constant:  20),
+            bottomBar.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -20),
+            bottomBar.bottomAnchor  .constraint(equalTo: cv.bottomAnchor,   constant: -16),
             bottomBar.heightAnchor  .constraint(equalToConstant: 28),
         ])
 
-        updateWindowHeight()
-    }
-
-    private func deviceHeaderRow() -> NSStackView {
-        let n = label("Name", bold: true); let i = label("IP-Adresse", bold: true)
-        n.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        i.widthAnchor.constraint(equalToConstant: 140).isActive = true
-        let ph = NSView(); ph.widthAnchor.constraint(equalToConstant: 28).isActive = true
-        let s = NSStackView(views: [n, i, ph]); s.spacing = 8; return s
-    }
-
-    @objc private func addRowTapped() { appendDeviceRow(name: "", ip: ""); updateWindowHeight() }
-
-    private func appendDeviceRow(name: String, ip: String) {
-        let nf = field(placeholder: "Gerätename", value: name)
-        let ipf = field(placeholder: "10.0.0.x", value: ip)
-        nf.widthAnchor.constraint(equalToConstant: 180).isActive = true
-        ipf.widthAnchor.constraint(equalToConstant: 140).isActive = true
-        let del = NSButton(title: "−", target: self, action: #selector(deleteRow(_:)))
-        del.bezelStyle = .rounded; del.widthAnchor.constraint(equalToConstant: 28).isActive = true
-        let row = NSStackView(views: [nf, ipf, del]); row.spacing = 8; row.alignment = .centerY
-        let insertIdx = 2 + rows.count
-        outerStack.insertArrangedSubview(row, at: insertIdx)
-        rows.append((name: nf, ip: ipf))
-    }
-
-    @objc private func deleteRow(_ sender: NSButton) {
-        guard let row = sender.superview as? NSStackView else { return }
-        rows.removeAll { row.arrangedSubviews.contains($0.name) }
-        outerStack.removeArrangedSubview(row); row.removeFromSuperview()
-        updateWindowHeight()
+        // Fensterhöhe: 3 Labels + 2 Felder + 1 Divider + Padding + Save-Button
+        let rowH: CGFloat = 24; let sp: CGFloat = 10
+        let rows: CGFloat = 6
+        let newH = 20 + rows * rowH + (rows - 1) * sp + 12 + 28 + 16
+        if let w = window { var f = w.frame; f.size.height = newH; w.setFrame(f, display: false) }
     }
 
     @objc private func saveTapped() {
-        let devices = rows
-            .map { Device(name: $0.name.stringValue.trimmingCharacters(in: .whitespaces),
-                          ip:   $0.ip  .stringValue.trimmingCharacters(in: .whitespaces)) }
-            .filter { !$0.name.isEmpty && !$0.ip.isEmpty }
-        let ip = meterField.stringValue.trimmingCharacters(in: .whitespaces)
-
-        let key    = mqttKeyField   .stringValue.trimmingCharacters(in: .whitespaces)
-        let secret = mqttSecretField.stringValue.trimmingCharacters(in: .whitespaces)
-        let devID  = mqttDeviceField.stringValue.trimmingCharacters(in: .whitespaces)
-        let broker = mqttBrokerField.stringValue.trimmingCharacters(in: .whitespaces)
-        let mqtt   = (!key.isEmpty && !secret.isEmpty && !devID.isEmpty)
-            ? MQTTConfig(appKey: key, appSecret: secret, deviceID: devID,
-                         broker: broker.isEmpty ? "mqtt-eu.zen-iot.com" : broker)
-            : nil
-
-        onSave(devices, ip, mqtt)
+        onSave(
+            meterField   .stringValue.trimmingCharacters(in: .whitespaces),
+            cloudKeyField.stringValue.trimmingCharacters(in: .whitespaces)
+        )
         window?.close()
     }
 
-    private func updateWindowHeight() {
-        guard let win = window else { return }
-        let deviceRows = CGFloat(2 + rows.count + 1)   // header + rows + add-button
-        let meterRows:  CGFloat = 2                    // label + field
-        let mqttRows:   CGFloat = 6                    // label + hint + 4 fields
-        let dividers:   CGFloat = 2
-        let total = deviceRows + meterRows + mqttRows + dividers
-        let rowH: CGFloat = 26; let sp: CGFloat = 8
-        let newH = 20 + total * rowH + (total - 1) * sp + 12 + 28 + 16
-        var f = win.frame; f.origin.y -= newH - f.height; f.size.height = newH
-        win.setFrame(f, display: true, animate: false)
-    }
-
-    // Helpers
     private func divider() -> NSBox {
         let b = NSBox(); b.boxType = .separator
         b.translatesAutoresizingMaskIntoConstraints = false
-        b.heightAnchor.constraint(equalToConstant: 1).isActive = true
-        return b
+        b.heightAnchor.constraint(equalToConstant: 1).isActive = true; return b
     }
     private func sectionLabel(_ t: String) -> NSTextField {
         let f = NSTextField(labelWithString: t)
-        f.font = NSFont.systemFont(ofSize: 11, weight: .semibold); f.textColor = .secondaryLabelColor; return f
+        f.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        f.textColor = .secondaryLabelColor; return f
     }
     private func field(placeholder: String, value: String) -> NSTextField {
         let f = NSTextField(string: value); f.placeholderString = placeholder; return f
     }
-    private func label(_ t: String, bold: Bool = false) -> NSTextField {
-        let f = NSTextField(labelWithString: t)
-        f.font = NSFont.systemFont(ofSize: 12, weight: bold ? .semibold : .regular)
-        f.textColor = .secondaryLabelColor; return f
-    }
     func showCentered() {
         window?.center(); NSApp.activate(ignoringOtherApps: true); showWindow(nil)
+    }
+}
+
+// MARK: - Verlauf-Fenster
+
+final class HistoryWindowController: NSWindowController {
+
+    private var selectedDate = Calendar.current.startOfDay(for: Date())
+    private var rangeHours   = 24
+
+    private let solarGraph = SolarGraphView(frame: .zero)
+    private let gridGraph  = SolarGraphView(frame: .zero)
+    private let dateLabel  = NSTextField(labelWithString: "")
+    private let rangeCtrl  = NSSegmentedControl()
+    private var refreshTimer: Timer?
+
+    init() {
+        let win = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 720, height: 520),
+            styleMask:   [.titled, .closable, .resizable, .miniaturizable],
+            backing: .buffered, defer: false)
+        win.title = "ZendureBar – Verlauf"
+        win.isReleasedWhenClosed = false
+        win.minSize = NSSize(width: 500, height: 380)
+        super.init(window: win)
+        buildUI()
+        reload()
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    private func buildUI() {
+        guard let cv = window?.contentView else { return }
+
+        let prevBtn = NSButton(title: "◀", target: self, action: #selector(prevDay))
+        prevBtn.bezelStyle = .rounded
+        let nextBtn = NSButton(title: "▶", target: self, action: #selector(nextDay))
+        nextBtn.bezelStyle = .rounded
+
+        dateLabel.font      = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        dateLabel.alignment = .center
+
+        rangeCtrl.segmentCount = 4
+        rangeCtrl.setLabel("1 h",  forSegment: 0)
+        rangeCtrl.setLabel("6 h",  forSegment: 1)
+        rangeCtrl.setLabel("24 h", forSegment: 2)
+        rangeCtrl.setLabel("7 T",  forSegment: 3)
+        rangeCtrl.selectedSegment = 2
+        rangeCtrl.target = self
+        rangeCtrl.action = #selector(rangeChanged)
+
+        let solarLabel = histLabel("☀︎  Solar")
+        let gridLabel  = histLabel("⚡  Netzbezug")
+
+        solarGraph.accent = NSColor(red: 1.0, green: 0.55, blue: 0.0, alpha: 1.0)
+        gridGraph.accent  = NSColor(red: 0.2, green: 0.75, blue: 0.3, alpha: 1.0)
+
+        let m: CGFloat = 16
+        for v in [prevBtn, dateLabel, nextBtn, rangeCtrl,
+                  solarLabel, solarGraph, gridLabel, gridGraph] as [NSView] {
+            v.translatesAutoresizingMaskIntoConstraints = false
+            cv.addSubview(v)
+        }
+
+        NSLayoutConstraint.activate([
+            prevBtn.topAnchor    .constraint(equalTo: cv.topAnchor,      constant: m),
+            prevBtn.leadingAnchor.constraint(equalTo: cv.leadingAnchor,  constant: m),
+
+            rangeCtrl.centerYAnchor  .constraint(equalTo: prevBtn.centerYAnchor),
+            rangeCtrl.trailingAnchor .constraint(equalTo: cv.trailingAnchor, constant: -m),
+
+            nextBtn.centerYAnchor .constraint(equalTo: prevBtn.centerYAnchor),
+            nextBtn.trailingAnchor.constraint(equalTo: rangeCtrl.leadingAnchor, constant: -12),
+
+            dateLabel.centerYAnchor  .constraint(equalTo: prevBtn.centerYAnchor),
+            dateLabel.leadingAnchor  .constraint(equalTo: prevBtn.trailingAnchor, constant: 8),
+            dateLabel.trailingAnchor .constraint(equalTo: nextBtn.leadingAnchor,  constant: -8),
+
+            solarLabel.topAnchor    .constraint(equalTo: prevBtn.bottomAnchor, constant: 14),
+            solarLabel.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: m),
+
+            solarGraph.topAnchor     .constraint(equalTo: solarLabel.bottomAnchor, constant: 4),
+            solarGraph.leadingAnchor .constraint(equalTo: cv.leadingAnchor,  constant: m),
+            solarGraph.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -m),
+            solarGraph.heightAnchor  .constraint(greaterThanOrEqualToConstant: 120),
+
+            gridLabel.topAnchor    .constraint(equalTo: solarGraph.bottomAnchor, constant: 14),
+            gridLabel.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: m),
+
+            gridGraph.topAnchor     .constraint(equalTo: gridLabel.bottomAnchor, constant: 4),
+            gridGraph.leadingAnchor .constraint(equalTo: cv.leadingAnchor,  constant: m),
+            gridGraph.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -m),
+            gridGraph.bottomAnchor  .constraint(equalTo: cv.bottomAnchor,   constant: -m),
+
+            solarGraph.heightAnchor.constraint(equalTo: gridGraph.heightAnchor),
+        ])
+    }
+
+    @objc private func prevDay() {
+        selectedDate = Calendar.current.date(byAdding: .day, value: -1, to: selectedDate)!
+        reload()
+    }
+    @objc private func nextDay() {
+        let next = Calendar.current.date(byAdding: .day, value: 1, to: selectedDate)!
+        guard Calendar.current.startOfDay(for: next) <= Calendar.current.startOfDay(for: Date()) else { return }
+        selectedDate = next
+        reload()
+    }
+    @objc private func rangeChanged() {
+        rangeHours = [1, 6, 24, 168][rangeCtrl.selectedSegment]
+        reload()
+    }
+
+    private func reload() {
+        let cal      = Calendar.current
+        let dayStart = selectedDate
+        let dayEnd   = cal.date(byAdding: .day, value: 1, to: dayStart)!
+        let now      = Date()
+        let to       = min(dayEnd, now)
+        let from: Date
+        switch rangeHours {
+        case 1:   from = cal.date(byAdding: .hour, value:  -1, to: to)!
+        case 6:   from = cal.date(byAdding: .hour, value:  -6, to: to)!
+        case 168: from = cal.date(byAdding: .day,  value:  -6, to: dayStart)!
+        default:  from = dayStart   // 24h = kompletter gewählter Tag
+        }
+
+        let fmt = DateFormatter()
+        fmt.locale = Locale(identifier: "de_DE")
+        if rangeHours == 168 {
+            fmt.dateFormat = "dd. MMM"
+            let toDay = cal.date(byAdding: .day, value: -1, to: dayEnd)!
+            dateLabel.stringValue = "\(fmt.string(from: from)) – \(fmt.string(from: toDay))"
+        } else {
+            fmt.dateStyle = .full; fmt.timeStyle = .none
+            dateLabel.stringValue = fmt.string(from: selectedDate)
+        }
+
+        let data = DataStore.shared.query(from: from, to: to)
+        solarGraph.history = data.solar
+        gridGraph.history  = data.grid
+        solarGraph.needsDisplay = true
+        gridGraph.needsDisplay  = true
+    }
+
+    private func histLabel(_ text: String) -> NSTextField {
+        let f = NSTextField(labelWithString: text)
+        f.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        f.textColor = .secondaryLabelColor
+        return f
+    }
+
+    func showCentered() {
+        // Heute automatisch alle 30 s aktualisieren wenn das Fenster offen ist
+        if refreshTimer == nil {
+            refreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+                guard let self, self.window?.isVisible == true,
+                      Calendar.current.isDateInToday(self.selectedDate) else { return }
+                self.reload()
+            }
+        }
+        window?.center()
+        NSApp.activate(ignoringOtherApps: true)
+        showWindow(nil)
     }
 }
 
@@ -455,7 +739,7 @@ final class SettingsWindowController: NSWindowController {
 
 final class SolarGraphView: NSView {
     var history: [(time: Date, watts: Int)] = []
-    private let accent = NSColor(red: 1.0, green: 0.55, blue: 0.0, alpha: 1.0)
+    var accent: NSColor = NSColor(red: 1.0, green: 0.55, blue: 0.0, alpha: 1.0)
 
     private func dyn(light: NSColor, dark: NSColor) -> NSColor {
         NSColor(name: nil) { $0.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light }
@@ -518,9 +802,9 @@ final class SolarGraphView: NSView {
         let span = display.last!.time.timeIntervalSince(display.first!.time)
         fmt.dateFormat = span > 72000 ? "dd. HH:mm" : "HH:mm"
         let xPts: [(CGFloat, String)] = [
-            (plot.minX,                  fmt.string(from: display.first!.time)),
-            (plot.minX + plot.width/2,   fmt.string(from: display[n/2].time)),
-            (plot.maxX,                  "jetzt")]
+            (plot.minX,                fmt.string(from: display.first!.time)),
+            (plot.minX + plot.width/2, fmt.string(from: display[n/2].time)),
+            (plot.maxX,                "jetzt")]
         let xa: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular), .foregroundColor: subtle]
         for (x, t) in xPts { let s = t as NSString; let sz = s.size(withAttributes: xa)
             s.draw(at: CGPoint(x: x-sz.width/2, y: 1), withAttributes: xa) }
@@ -532,21 +816,21 @@ final class SolarGraphView: NSView {
 final class ZendureBarController: NSObject {
 
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    private var timer: Timer?
 
-    // HTTP-Daten (SolarFlow-Geräte)
-    private var devices:   [Device] = []
-    private var meterIP:   String   = ""
-    private var meterData: ShellMeterData?
-    private var solarHistory: [(time: Date, watts: Int)] = []
-
-    // MQTT-Daten (Hyper 2000)
-    private var mqttConfig:  MQTTConfig?
-    private var mqttManager: HyperMQTTManager?
-    private var hyperData:   DeviceData?
-    private var mqttStatus   = "disconnected"
+    // MQTT-Daten (alle Zendure-Geräte via Cloud Key)
+    private var cloudKey:        String = ""
+    private var meterIP:         String = ""
+    private var mqttManager:     ZendureMQTTManager?
+    private var deviceData:      [String: DeviceData] = [:]   // name → letzter Stand
+    private var mqttStatus       = "disconnected"
+    private var meterData:       ShellMeterData?
+    private var solarHistory:       [(time: Date, watts: Int)] = []
+    private var consumptionHistory: [(time: Date, watts: Int)] = []
+    private var gridHistory:        [(time: Date, watts: Int)] = []
+    private var meterTimer:      Timer?
 
     private var settingsController: SettingsWindowController?
+    private var historyController:  HistoryWindowController?
 
     private let primaryColor = NSColor(name: nil) { app in
         app.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
@@ -555,17 +839,22 @@ final class ZendureBarController: NSObject {
 
     override init() {
         super.init()
-        devices    = Prefs.loadDevices()
-        meterIP    = Prefs.loadMeterIP()
-        mqttConfig = Prefs.loadMQTTConfig()
+        cloudKey = Prefs.loadCloudKey()
+        meterIP  = Prefs.loadMeterIP()
+
+        // Heutigen Tag aus der Datenbank vorladen – Graphen sind sofort gefüllt
+        let stored = DataStore.shared.todayData()
+        solarHistory = stored.solar
+        gridHistory  = stored.grid
 
         statusItem.button?.title = "— W"
         statusItem.button?.font  = NSFont.monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
 
-        buildMenu(zendure: [])
+        buildMenu()
         setupMQTT()
+        startMeterPolling()
 
-        if devices.isEmpty && mqttConfig == nil { openSettings() } else { startPolling() }
+        if cloudKey.isEmpty { openSettings() }
     }
 
     // MARK: - MQTT
@@ -573,186 +862,138 @@ final class ZendureBarController: NSObject {
     private func setupMQTT() {
         mqttManager?.disconnect()
         mqttManager = nil
-        guard let cfg = mqttConfig, cfg.isValid else { return }
+        deviceData  = [:]
+        guard !cloudKey.isEmpty else { return }
 
-        let manager = HyperMQTTManager(config: cfg)
-        manager.onStatus = { [weak self] status in
-            DispatchQueue.main.async {
-                switch status {
-                case .connected:    self?.mqttStatus = "connected"
-                case .connecting:   self?.mqttStatus = "connecting"
-                case .disconnected: self?.mqttStatus = "disconnected"
-                case .error(let e): self?.mqttStatus = "error: \(e)"
-                }
-                self?.buildMenu(zendure: [])
-            }
-        }
-        manager.onData = { [weak self] data in
-            self?.hyperData = data
-            // Menü nur neu bauen wenn auch Zendure-Daten schon vorhanden
-            self?.buildMenu(zendure: self?.lastZendureResults ?? [])
-        }
-        mqttManager = manager
-    }
+        mqttStatus = "connecting"
+        buildMenu()
 
-    private var lastZendureResults: [DeviceData] = []
-
-    // MARK: - Polling (HTTP)
-
-    private func startPolling() {
-        timer?.invalidate()
-        fetchAll()
-        timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
-            self?.fetchAll()
-        }
-    }
-
-    private func fetchAll() {
-        let group = DispatchGroup()
-        var collected: [DeviceData] = []
-        var newMeter:  ShellMeterData?
-        let lock = NSLock()
-
-        for device in devices {
-            guard let url = URL(string: "http://\(device.ip)/properties/report") else { continue }
-            group.enter()
-            URLSession.shared.dataTask(with: url) { data, _, error in
-                defer { group.leave() }
-                guard error == nil, let data,
-                      let json  = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      let props = json["properties"] as? [String: Any] else { return }
-
-                let solar    = props["solarInputPower"]  as? Int ?? 0
-                let home     = props["outputHomePower"]  as? Int ?? 0
-                let battery  = props["electricLevel"]    as? Int ?? 0
-                let packIn   = props["packInputPower"]   as? Int ?? 0
-                let packOut  = props["outputPackPower"]  as? Int ?? 0
-                let gridIn   = props["gridInputPower"]   as? Int ?? 0
-                let remOut   = props["remainOutTime"]    as? Int ?? 0
-                let remIn    = props["remainInputTime"]  as? Int ?? 0
-                let hyperTmp = props["hyperTmp"]         as? Int ?? 0
-                let rssi     = props["rssi"]             as? Int ?? 0
-
-                let channels = (1...4).compactMap { i -> Int? in
-                    let w = props["solarPower\(i)"] as? Int ?? 0; return w > 0 ? w : nil
-                }
-                var packs: [BatteryPack] = []
-                if let arr = json["packData"] as? [[String: Any]] {
-                    for p in arr {
-                        let rawT = p["maxTemp"]  as? Int ?? 0; let rawV = p["totalVol"] as? Int ?? 0
-                        packs.append(BatteryPack(socLevel: p["socLevel"] as? Int ?? 0,
-                            tempCelsius: rawT > 2731 ? Double(rawT-2731)/10 : 0,
-                            voltageV: Double(rawV)/100, state: p["state"] as? Int ?? 0))
-                    }
-                }
-                let result = DeviceData(
-                    name: device.name, solarPower: solar, solarChannels: channels,
-                    homeOutput: home, batteryLevel: battery, batteryCharge: packIn,
-                    batteryDischarge: packOut, gridInput: gridIn,
-                    remainSeconds: packOut > 0 ? remOut : (packIn > 0 ? remIn : 0),
-                    deviceTempC: hyperTmp > 2731 ? Double(hyperTmp-2731)/10 : 0,
-                    packs: packs, rssi: rssi)
-                lock.lock(); collected.append(result); lock.unlock()
-            }.resume()
-        }
-
-        if !meterIP.isEmpty, let url = URL(string: "http://\(meterIP)/rpc/EM.GetStatus?id=0") {
-            group.enter()
-            URLSession.shared.dataTask(with: url) { data, _, error in
-                defer { group.leave() }
-                guard error == nil, let data,
-                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
-                let m = ShellMeterData(
-                    totalPower: json["total_act_power"] as? Double ?? 0,
-                    phaseA: json["a_act_power"] as? Double ?? 0, phaseB: json["b_act_power"] as? Double ?? 0,
-                    phaseC: json["c_act_power"] as? Double ?? 0, voltageA: json["a_voltage"] as? Double ?? 0,
-                    voltageB: json["b_voltage"] as? Double ?? 0, voltageC: json["c_voltage"] as? Double ?? 0)
-                lock.lock(); newMeter = m; lock.unlock()
-            }.resume()
-        }
-
-        group.notify(queue: .main) { [weak self] in
+        ZendureAPI.fetchDeviceList(cloudKey: cloudKey) { [weak self] creds, cloudDevices in
             guard let self else { return }
-            let ordered = self.devices.compactMap { d in collected.first { $0.name == d.name } }
-            if let m = newMeter { self.meterData = m }
-            let total = ordered.reduce(0) { $0 + $1.solarPower }
-            self.solarHistory.append((time: Date(), watts: total))
-            self.lastZendureResults = ordered
-            self.updateStatusButton(zendure: ordered)
-            self.buildMenu(zendure: ordered)
+            guard let creds else {
+                self.mqttStatus = "API-Fehler"; self.buildMenu()
+                mqttLog("[Setup] API-Fehler"); return
+            }
+            mqttLog("[Setup] \(cloudDevices.count) Gerät(e), starte MQTT")
+            let manager = ZendureMQTTManager(credentials: creds, devices: cloudDevices)
+            manager.onStatus = { [weak self] status in
+                DispatchQueue.main.async {
+                    switch status {
+                    case .connected:    self?.mqttStatus = "connected"
+                    case .connecting:   self?.mqttStatus = "connecting"
+                    case .disconnected: self?.mqttStatus = "disconnected"
+                    case .error(let e): self?.mqttStatus = "error: \(e)"
+                    }
+                    self?.buildMenu()
+                }
+            }
+            manager.onData = { [weak self] data in
+                guard let self else { return }
+                let isNew = self.deviceData[data.name] == nil
+                self.deviceData[data.name] = data
+                // Solar-History bei jedem Update aktualisieren
+                let total = self.deviceData.values.reduce(0) { $0 + $1.solarPower }
+                self.solarHistory.append((time: Date(), watts: total))
+                if self.solarHistory.count > 2000 { self.solarHistory.removeFirst() }
+                self.updateStatusButton()
+                self.buildMenu()
+                _ = isNew  // suppress warning
+            }
+            self.mqttManager = manager
         }
     }
 
-    private func updateStatusButton(zendure: [DeviceData]) {
-        let zTotal = zendure.reduce(0) { $0 + $1.solarPower }
-        let hTotal = hyperData?.solarPower ?? 0
-        let total  = zTotal + hTotal
+    // MARK: - Smart Meter Polling (Shelly – bleibt HTTP)
+
+    private func startMeterPolling() {
+        meterTimer?.invalidate()
+        guard !meterIP.isEmpty else { return }
+        fetchMeter()
+        meterTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+            self?.fetchMeter()
+        }
+    }
+
+    private func fetchMeter() {
+        guard !meterIP.isEmpty, let url = URL(string: "http://\(meterIP)/rpc/EM.GetStatus?id=0") else { return }
+        URLSession.shared.dataTask(with: url) { [weak self] data, _, error in
+            guard error == nil, let data,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            let m = ShellMeterData(
+                totalPower: json["total_act_power"] as? Double ?? 0,
+                phaseA:    json["a_act_power"] as? Double ?? 0,
+                phaseB:    json["b_act_power"] as? Double ?? 0,
+                phaseC:    json["c_act_power"] as? Double ?? 0,
+                voltageA:  json["a_voltage"]   as? Double ?? 0,
+                voltageB:  json["b_voltage"]   as? Double ?? 0,
+                voltageC:  json["c_voltage"]   as? Double ?? 0)
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.meterData = m
+                // Verbrauch = was Geräte ins Hausnetz liefern + Netzbezug (immer ≥ 0)
+                let homeFromDevices = self.deviceData.values.reduce(0) { $0 + $1.homeOutput }
+                let gridImport      = max(0, m.totalPower)
+                let consumption     = max(0, homeFromDevices + Int(gridImport.rounded()))
+                self.consumptionHistory.append((time: Date(), watts: consumption))
+                if self.consumptionHistory.count > 2000 { self.consumptionHistory.removeFirst() }
+                let gridW = Int(gridImport.rounded())
+                self.gridHistory.append((time: Date(), watts: gridW))
+                if self.gridHistory.count > 2000 { self.gridHistory.removeFirst() }
+                // In SQLite persistieren (throttled auf 1× / 10 s)
+                let totalSolar = self.deviceData.values.reduce(0) { $0 + $1.solarPower }
+                DataStore.shared.insert(solar: totalSolar, grid: gridW)
+                self.buildMenu()
+            }
+        }.resume()
+    }
+
+    private func updateStatusButton() {
+        let total = deviceData.values.reduce(0) { $0 + $1.solarPower }
         statusItem.button?.title = total > 0 ? "\(total) W" : "— W"
     }
 
-    // MARK: - Menü aufbauen
+    // MARK: - Menü
 
-    private func buildMenu(zendure: [DeviceData]) {
-        let menu = NSMenu()
-        let allDevices = zendure + (hyperData.map { [$0] } ?? [])
+    private func buildMenu() {
+        let menu  = NSMenu()
+        let devs  = Array(deviceData.values)
+            .sorted { $0.name < $1.name }   // konsistente Reihenfolge
 
-        if allDevices.isEmpty && mqttStatus != "connected" {
-            menu.addItem(row("antenna.radiowaves.left.and.right",
-                mqttConfig != nil ? "MQTT: \(mqttStatus)" : "Keine Geräte konfiguriert", ""))
+        if devs.isEmpty {
+            let txt = cloudKey.isEmpty ? "Kein Cloud Key konfiguriert" : "MQTT: \(mqttStatus)"
+            menu.addItem(row("antenna.radiowaves.left.and.right", txt, ""))
         } else {
             // ── Gesamt ──────────────────────────────────────────────────
-            let totalSolar = allDevices.reduce(0) { $0 + $1.solarPower }
-            let totalBattD = allDevices.reduce(0) { $0 + $1.batteryDischarge }
-            let totalBattC = allDevices.reduce(0) { $0 + $1.batteryCharge }
-
+            let totalSolar = devs.reduce(0) { $0 + $1.solarPower }
+            let totalBattD = devs.reduce(0) { $0 + $1.batteryDischarge }
+            let totalBattC = devs.reduce(0) { $0 + $1.batteryCharge }
             menu.addItem(section("Gesamt"))
             menu.addItem(row("sun.max.fill", "Solar", watts(totalSolar)))
 
             if let m = meterData {
                 let grid = m.totalPower
-                let consumption = Double(totalSolar + totalBattD - totalBattC) + max(0, grid)
-                menu.addItem(row("house.fill", "Hausverbrauch", watts(Int(consumption.rounded()))))
-                if grid >= 0 { menu.addItem(row("powerplug.fill",   "Netzbezug",  wattsDbl(grid))) }
+                let cons = Double(totalSolar + totalBattD - totalBattC) + max(0, grid)
+                menu.addItem(row("house.fill", "Hausverbrauch", watts(Int(cons.rounded()))))
+                if grid >= 0 { menu.addItem(row("powerplug.fill",   "Netzbezug",   wattsDbl(grid))) }
                 else         { menu.addItem(row("arrow.up.to.line", "Einspeisung", wattsDbl(-grid))) }
             } else {
-                let totalHome = allDevices.reduce(0) { $0 + $1.homeOutput }
+                let totalHome = devs.reduce(0) { $0 + $1.homeOutput }
                 menu.addItem(row("house.fill", "Hausverbrauch", watts(totalHome)))
             }
+            // ── Solar-Graph direkt unter den Gesamtwerten ────────────────
+            menu.addItem(graphMenuItem(history: solarHistory))
             menu.addItem(.separator())
 
-            // ── Je HTTP-Gerät (SolarFlow) ────────────────────────────────
-            for d in zendure { deviceItems(d).forEach { menu.addItem($0) }; menu.addItem(.separator()) }
-
-            // ── Hyper 2000 (MQTT) ────────────────────────────────────────
-            if let h = hyperData {
-                menu.addItem(section("Zendure \(h.name)"))
-                if h.solarChannels.count > 1 {
-                    menu.addItem(row("sun.max.fill", "Solar gesamt", watts(h.solarPower)))
-                    for (i, ch) in h.solarChannels.enumerated() { menu.addItem(row("sun.min", "Kanal \(i+1)", watts(ch))) }
-                } else {
-                    menu.addItem(row("sun.max.fill", "Solar", watts(h.solarPower)))
-                }
-                if h.homeOutput > 0 { menu.addItem(row("house.fill", "Hausverbrauch", watts(h.homeOutput))) }
-                if h.gridInput  > 0 { menu.addItem(row("powerplug.fill", "Netzbezug", watts(h.gridInput))) }
-                let (batSym, batDetail) = batteryRow(h)
-                menu.addItem(row(batSym, "Batterie", batDetail))
-                if h.remainSeconds > 0 && h.remainSeconds < 50_000 {
-                    let hh = h.remainSeconds/3600, mm = (h.remainSeconds%3600)/60
-                    menu.addItem(row("clock", h.batteryCharge > 0 ? "Voll in" : "Leer in",
-                        String(format: "%d h %02d min", hh, mm)))
-                }
-                if h.deviceTempC > 0 {
-                    menu.addItem(row("thermometer.medium", "Temperatur", String(format: "%.1f °C", h.deviceTempC)))
-                }
-                let mqttIndicator = mqttStatus == "connected" ? "MQTT ●" : "MQTT ○"
-                menu.addItem(row("dot.radiowaves.left.and.right", "Verbindung", mqttIndicator))
-                menu.addItem(graphMenuItem())
-                menu.addItem(.separator())
-            } else if mqttConfig != nil {
-                menu.addItem(section("Zendure Hyper 2000"))
-                menu.addItem(row("dot.radiowaves.left.and.right", "MQTT", mqttStatus))
+            // ── Je Gerät ─────────────────────────────────────────────────
+            for d in devs {
+                deviceItems(d).forEach { menu.addItem($0) }
                 menu.addItem(.separator())
             }
+
+            // ── MQTT-Status ───────────────────────────────────────────────
+            let dot = mqttStatus == "connected" ? "●" : "○"
+            menu.addItem(row("dot.radiowaves.left.and.right", "MQTT", "\(dot) \(mqttStatus)"))
+            menu.addItem(.separator())
 
             // ── Smart Meter ───────────────────────────────────────────────
             if let m = meterData {
@@ -762,12 +1003,19 @@ final class ZendureBarController: NSObject {
                 for (name, pwr, volt) in [("Phase A", m.phaseA, m.voltageA),
                                            ("Phase B", m.phaseB, m.voltageB),
                                            ("Phase C", m.phaseC, m.voltageC)] where volt > 10 {
-                    menu.addItem(row("circle.dotted", name, "\(wattsDbl(pwr))  ·  \(String(format: "%.0f V", volt))"))
+                    menu.addItem(row("circle.dotted", name,
+                        "\(wattsDbl(pwr))  ·  \(String(format: "%.0f V", volt))"))
                 }
+                // Netzbezug-Graph in Grün
+                menu.addItem(graphMenuItem(
+                    history: gridHistory,
+                    color: NSColor(red: 0.2, green: 0.75, blue: 0.3, alpha: 1.0)))
                 menu.addItem(.separator())
             }
         }
 
+        let h = NSMenuItem(title: "Verlauf…", action: #selector(openHistory), keyEquivalent: "h")
+        h.target = self; menu.addItem(h)
         let s = NSMenuItem(title: "Einstellungen…", action: #selector(openSettings), keyEquivalent: ",")
         s.target = self; menu.addItem(s)
         menu.addItem(NSMenuItem(title: "Beenden", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -777,60 +1025,120 @@ final class ZendureBarController: NSObject {
     private func deviceItems(_ d: DeviceData) -> [NSMenuItem] {
         var items = [NSMenuItem]()
         items.append(section("Zendure \(d.name)"))
+
+        // Solar
         if d.solarChannels.count > 1 {
             items.append(row("sun.max.fill", "Solar gesamt", watts(d.solarPower)))
-            for (i, ch) in d.solarChannels.enumerated() { items.append(row("sun.min", "Kanal \(i+1)", watts(ch))) }
-        } else { items.append(row("sun.max.fill", "Solar", watts(d.solarPower))) }
+            for (i, ch) in d.solarChannels.enumerated() {
+                items.append(row("sun.min", "Kanal \(i+1)", watts(ch)))
+            }
+        } else {
+            items.append(row("sun.max.fill", "Solar", watts(d.solarPower)))
+        }
+
+        // Hausverbrauch
         items.append(row("house.fill", "Hausverbrauch", watts(d.homeOutput)))
-        if d.gridInput > 0 { items.append(row("powerplug.fill", "Netzbezug", watts(d.gridInput))) }
+
+        // Netzbezug (nur wenn vorhanden)
+        if d.gridInput > 0 {
+            items.append(row("powerplug.fill", "Netzbezug", watts(d.gridInput)))
+        }
+
+        // Batterie
         let (batSym, batDetail) = batteryRow(d)
         items.append(row(batSym, "Batterie", batDetail))
+
+        // Restzeit
         if d.remainSeconds > 0 && d.remainSeconds < 50_000 {
-            let h = d.remainSeconds/3600, m = (d.remainSeconds%3600)/60
+            let h = d.remainSeconds / 3600; let m = (d.remainSeconds % 3600) / 60
             items.append(row("clock", d.batteryCharge > 0 ? "Voll in" : "Leer in",
                 String(format: "%d h %02d min", h, m)))
         }
-        if d.packs.count > 1 {
+
+        // Packs
+        if !d.packs.isEmpty {
             for (i, p) in d.packs.enumerated() {
-                let s = p.state == 1 ? "↑" : p.state == 2 ? "↓" : "·"
-                items.append(row("square.stack", "Pack \(i+1)",
-                    "\(p.socLevel) %  \(String(format: "%.1f V", p.voltageV))  \(String(format: "%.0f °C", p.tempCelsius))  \(s)"))
+                let arrow  = p.state == 1 ? "↑" : p.state == 2 ? "↓" : "·"
+                let label  = d.packs.count > 1 ? "Pack \(i+1)" : "Pack"
+                let socStr = p.socLevel > 0   ? "\(p.socLevel) %" : "–"
+                let tmpStr = p.tempCelsius > 0 ? String(format: "%.0f °C", p.tempCelsius) : "–"
+                let volStr = p.voltageV > 0   ? String(format: "%.1f V", p.voltageV) : "–"
+                items.append(row("square.stack", label, "\(socStr)  \(volStr)  \(tmpStr)  \(arrow)"))
             }
         }
-        if d.deviceTempC > 0 { items.append(row("thermometer.medium", "Temperatur", String(format: "%.1f °C", d.deviceTempC))) }
-        if d.rssi != 0 { items.append(row("wifi", "WLAN", "\(d.rssi) dBm")) }
-        items.append(graphMenuItem())
+
+        // Gerätetemperatur
+        if d.deviceTempC > 0 {
+            items.append(row("thermometer.medium", "Temperatur", String(format: "%.1f °C", d.deviceTempC)))
+        }
+
+        // WLAN-Signal
+        if d.rssi != 0 {
+            items.append(row("wifi", "WLAN", "\(d.rssi) dBm"))
+        }
+
         return items
     }
 
     private func batteryRow(_ d: DeviceData) -> (String, String) {
-        if d.batteryCharge    > 0 { return ("battery.100percent.bolt", "\(d.batteryLevel) %  ·  Laden \(watts(d.batteryCharge))") }
-        if d.batteryDischarge > 0 { return ("battery.50percent",       "\(d.batteryLevel) %  ·  Entladen \(watts(d.batteryDischarge))") }
-        return ("battery.100percent", "\(d.batteryLevel) %  ·  Standby")
+        let soc = d.batteryLevel > 0 ? "\(d.batteryLevel) %" : "– %"
+        if d.batteryCharge    > 0 { return ("battery.100percent.bolt", "\(soc)  ·  Laden \(watts(d.batteryCharge))") }
+        if d.batteryDischarge > 0 { return ("battery.50percent",       "\(soc)  ·  Entladen \(watts(d.batteryDischarge))") }
+        return ("battery.100percent", "\(soc)  ·  Standby")
     }
 
-    private func graphMenuItem() -> NSMenuItem {
+    private func graphMenuItem(history: [(time: Date, watts: Int)],
+                               color: NSColor = NSColor(red: 1.0, green: 0.55, blue: 0.0, alpha: 1.0)) -> NSMenuItem {
         let item = NSMenuItem()
-        let view = SolarGraphView(frame: NSRect(x: 0, y: 0, width: 280, height: 114))
-        view.autoresizingMask = [.width]; view.history = solarHistory
-        item.view = view; return item
+        let margin: CGFloat = 17   // fluchtet mit der Icon-Spalte der Menü-Zeilen
+        let graphH: CGFloat = 110
+        let totalH = graphH + 8    // 4 px Luft oben + unten
+
+        let graph = SolarGraphView(frame: NSRect(x: margin, y: 4, width: 280, height: graphH))
+        graph.autoresizingMask = [.width]
+        graph.history = history
+        graph.accent  = color
+
+        let container = NSView(frame: NSRect(x: 0, y: 0, width: 280, height: totalH))
+        container.autoresizingMask = [.width]
+        container.addSubview(graph)
+
+        // rechten Rand symmetrisch halten wenn Fenster breiter wird
+        graph.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            graph.leadingAnchor .constraint(equalTo: container.leadingAnchor,  constant:  margin),
+            graph.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -margin),
+            graph.topAnchor     .constraint(equalTo: container.topAnchor,      constant: 4),
+            graph.bottomAnchor  .constraint(equalTo: container.bottomAnchor,   constant: -4),
+        ])
+
+        item.view = container
+        return item
     }
 
     // MARK: - Einstellungen
 
     @objc func openSettings() {
-        let ctrl = SettingsWindowController(devices: devices, meterIP: meterIP, mqttConfig: mqttConfig)
-        ctrl.onSave = { [weak self] newDevices, newMeter, newMQTT in
+        let ctrl = SettingsWindowController(meterIP: meterIP, cloudKey: cloudKey)
+        ctrl.onSave = { [weak self] newMeter, newKey in
             guard let self else { return }
-            Prefs.save(devices: newDevices); Prefs.save(meterIP: newMeter); Prefs.save(mqttConfig: newMQTT)
-            self.devices = newDevices; self.meterIP = newMeter; self.mqttConfig = newMQTT
-            self.meterData = nil; self.hyperData = nil; self.solarHistory = []
+            Prefs.save(meterIP: newMeter)
+            Prefs.save(cloudKey: newKey)
+            let keyChanged = self.cloudKey != newKey
+            self.meterIP  = newMeter
+            self.cloudKey = newKey
+            self.meterData = nil
             self.statusItem.button?.title = "— W"
-            self.setupMQTT()
-            self.buildMenu(zendure: [])
-            self.startPolling()
+            if keyChanged { self.setupMQTT() }
+            self.startMeterPolling()
+            self.buildMenu()
         }
         ctrl.showCentered(); settingsController = ctrl
+    }
+
+    @objc func openHistory() {
+        if historyController == nil { historyController = HistoryWindowController() }
+        historyController?.showCentered()
     }
 
     // MARK: - Hilfsfunktionen
@@ -844,15 +1152,20 @@ final class ZendureBarController: NSObject {
     private func row(_ symbol: String, _ label: String, _ value: String) -> NSMenuItem {
         let item = NSMenuItem(); item.isEnabled = false
         if let img = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
-            item.image = img.withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: 11, weight: .regular))
+            item.image = img.withSymbolConfiguration(
+                NSImage.SymbolConfiguration(pointSize: 11, weight: .regular))
         }
         item.attributedTitle = NSAttributedString(
             string: "\(label.padding(toLength: 16, withPad: " ", startingAt: 0))\(value)",
             attributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 13, weight: .regular),
                          .foregroundColor: primaryColor]); return item
     }
-    private func watts(_ w: Int) -> String { w >= 1000 ? String(format: "%.2f kW", Double(w)/1000) : "\(w) W" }
-    private func wattsDbl(_ w: Double) -> String { w >= 1000 ? String(format: "%.2f kW", w/1000) : String(format: "%.0f W", w) }
+    private func watts(_ w: Int) -> String {
+        w >= 1000 ? String(format: "%.2f kW", Double(w)/1000) : "\(w) W"
+    }
+    private func wattsDbl(_ w: Double) -> String {
+        w >= 1000 ? String(format: "%.2f kW", w/1000) : String(format: "%.0f W", w)
+    }
 }
 
 // MARK: - App-Einstiegspunkt
