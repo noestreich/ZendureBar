@@ -125,6 +125,35 @@ final class DataStore {
     func todayData() -> (solar: [(time: Date, watts: Int)], grid: [(time: Date, watts: Int)]) {
         query(from: Calendar.current.startOfDay(for: Date()), to: Date())
     }
+
+    /// Wattstunden-Summe für einen Zeitraum (jeder Eintrag ≈ 10 s Abtastintervall)
+    func sumWh(from: Date, to: Date) -> (solarWh: Double, gridWh: Double) {
+        let sql = """
+            SELECT COALESCE(SUM(CAST(solar_w AS REAL)), 0.0),
+                   COALESCE(SUM(CAST(grid_w  AS REAL)), 0.0)
+            FROM readings
+            WHERE ts >= \(Int(from.timeIntervalSince1970))
+              AND ts <= \(Int(to.timeIntervalSince1970))
+        """
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else { return (0, 0) }
+        defer { sqlite3_finalize(stmt) }
+        sqlite3_step(stmt)
+        // Watt × 10 s / 3600 = Wh
+        return (sqlite3_column_double(stmt, 0) * 10 / 3600,
+                sqlite3_column_double(stmt, 1) * 10 / 3600)
+    }
+
+    /// Tagesweise Summen der letzten `days` Tage (neuester Tag zuletzt)
+    func weeklyTotals(days: Int = 7) -> [(date: Date, solarWh: Double, gridWh: Double)] {
+        let cal = Calendar.current
+        return (0..<days).reversed().map { offset in
+            let day    = cal.date(byAdding: .day, value: -offset, to: cal.startOfDay(for: Date()))!
+            let dayEnd = cal.date(byAdding: .day, value: 1, to: day)!
+            let s      = sumWh(from: day, to: dayEnd)
+            return (date: day, solarWh: s.solarWh, gridWh: s.gridWh)
+        }
+    }
 }
 
 // MARK: - UserDefaults
@@ -574,40 +603,57 @@ final class SettingsWindowController: NSWindowController {
 
 // MARK: - Verlauf-Fenster
 
-final class HistoryWindowController: NSWindowController {
+final class HistoryWindowController: NSWindowController, NSTableViewDataSource, NSTableViewDelegate {
 
-    private var selectedDate = Calendar.current.startOfDay(for: Date())
-    private var rangeHours   = 24
+    private var selectedDate  = Calendar.current.startOfDay(for: Date())
+    private var rangeHours    = 24
+    private var lastScrollEvt = Date.distantPast
 
+    // Graph-Views
     private let solarGraph = SolarGraphView(frame: .zero)
     private let gridGraph  = SolarGraphView(frame: .zero)
+
+    // Toolbar
     private let dateLabel  = NSTextField(labelWithString: "")
     private let rangeCtrl  = NSSegmentedControl()
+
+    // Zusammenfassung (kWh)
+    private let summaryLabel = NSTextField(labelWithString: "")
+
+    // Wochentabelle (nur in 7T-Ansicht sichtbar)
+    private let tableScroll = NSScrollView()
+    private let tableView   = NSTableView()
+    private var weekRows: [(date: Date, solarWh: Double, gridWh: Double)] = []
+    private var tableHeightConstraint: NSLayoutConstraint!
+
     private var refreshTimer: Timer?
 
     init() {
         let win = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 720, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 740, height: 580),
             styleMask:   [.titled, .closable, .resizable, .miniaturizable],
             backing: .buffered, defer: false)
         win.title = "ZendureBar – Verlauf"
         win.isReleasedWhenClosed = false
-        win.minSize = NSSize(width: 500, height: 380)
+        win.minSize = NSSize(width: 520, height: 420)
         super.init(window: win)
         buildUI()
         reload()
     }
     required init?(coder: NSCoder) { fatalError() }
 
+    // MARK: UI
+
     private func buildUI() {
         guard let cv = window?.contentView else { return }
 
+        // ── Toolbar ───────────────────────────────────────────────────────────
         let prevBtn = NSButton(title: "◀", target: self, action: #selector(prevDay))
         prevBtn.bezelStyle = .rounded
         let nextBtn = NSButton(title: "▶", target: self, action: #selector(nextDay))
         nextBtn.bezelStyle = .rounded
 
-        dateLabel.font      = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        dateLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         dateLabel.alignment = .center
 
         rangeCtrl.segmentCount = 4
@@ -616,55 +662,103 @@ final class HistoryWindowController: NSWindowController {
         rangeCtrl.setLabel("24 h", forSegment: 2)
         rangeCtrl.setLabel("7 T",  forSegment: 3)
         rangeCtrl.selectedSegment = 2
-        rangeCtrl.target = self
-        rangeCtrl.action = #selector(rangeChanged)
+        rangeCtrl.target = self; rangeCtrl.action = #selector(rangeChanged)
 
-        let solarLabel = histLabel("☀︎  Solar")
-        let gridLabel  = histLabel("⚡  Netzbezug")
+        // ── Zusammenfassung ───────────────────────────────────────────────────
+        summaryLabel.font      = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        summaryLabel.textColor = .secondaryLabelColor
+        summaryLabel.alignment = .right
+
+        // ── Graph-Labels ──────────────────────────────────────────────────────
+        let solarLbl = histLabel("☀︎  Solar")
+        let gridLbl  = histLabel("⚡  Netzbezug")
 
         solarGraph.accent = NSColor(red: 1.0, green: 0.55, blue: 0.0, alpha: 1.0)
         gridGraph.accent  = NSColor(red: 0.2, green: 0.75, blue: 0.3, alpha: 1.0)
 
+        // Scroll-Zoom: Mausrad wechselt Zeitbereich
+        let scrollZoom: (CGFloat) -> Void = { [weak self] delta in
+            guard let self, Date().timeIntervalSince(self.lastScrollEvt) > 0.4 else { return }
+            self.lastScrollEvt = Date()
+            let steps = [1, 6, 24, 168]
+            let idx   = steps.firstIndex(of: self.rangeHours) ?? 2
+            let newIdx = delta > 0 ? max(0, idx-1) : min(steps.count-1, idx+1)
+            guard newIdx != idx else { return }
+            self.rangeHours = steps[newIdx]
+            self.rangeCtrl.selectedSegment = newIdx
+            self.reload()
+        }
+        solarGraph.onScroll = scrollZoom
+        gridGraph.onScroll  = scrollZoom
+
+        // ── Wochentabelle ─────────────────────────────────────────────────────
+        for col in [("Datum", 140), ("☀︎  Solar", 130), ("⚡  Netzbezug", 130)] as [(String, Int)] {
+            let c = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(col.0))
+            c.title = col.0; c.width = CGFloat(col.1); c.resizingMask = .autoresizingMask
+            tableView.addTableColumn(c)
+        }
+        tableView.dataSource = self; tableView.delegate = self
+        tableView.headerView = NSTableHeaderView()
+        tableView.rowHeight  = 22
+        tableView.gridStyleMask = .solidHorizontalGridLineMask
+        tableScroll.documentView     = tableView
+        tableScroll.hasVerticalScroller = false
+        tableScroll.borderType = .noBorder
+
+        // ── Layout ────────────────────────────────────────────────────────────
         let m: CGFloat = 16
         for v in [prevBtn, dateLabel, nextBtn, rangeCtrl,
-                  solarLabel, solarGraph, gridLabel, gridGraph] as [NSView] {
+                  summaryLabel, solarLbl, solarGraph, gridLbl, gridGraph,
+                  tableScroll] as [NSView] {
             v.translatesAutoresizingMaskIntoConstraints = false
             cv.addSubview(v)
         }
 
+        tableHeightConstraint = tableScroll.heightAnchor.constraint(equalToConstant: 0)
+
         NSLayoutConstraint.activate([
-            prevBtn.topAnchor    .constraint(equalTo: cv.topAnchor,      constant: m),
-            prevBtn.leadingAnchor.constraint(equalTo: cv.leadingAnchor,  constant: m),
-
-            rangeCtrl.centerYAnchor  .constraint(equalTo: prevBtn.centerYAnchor),
-            rangeCtrl.trailingAnchor .constraint(equalTo: cv.trailingAnchor, constant: -m),
-
+            // Toolbar
+            prevBtn.topAnchor    .constraint(equalTo: cv.topAnchor,     constant: m),
+            prevBtn.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: m),
+            rangeCtrl.centerYAnchor .constraint(equalTo: prevBtn.centerYAnchor),
+            rangeCtrl.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -m),
             nextBtn.centerYAnchor .constraint(equalTo: prevBtn.centerYAnchor),
             nextBtn.trailingAnchor.constraint(equalTo: rangeCtrl.leadingAnchor, constant: -12),
+            dateLabel.centerYAnchor .constraint(equalTo: prevBtn.centerYAnchor),
+            dateLabel.leadingAnchor .constraint(equalTo: prevBtn.trailingAnchor, constant: 8),
+            dateLabel.trailingAnchor.constraint(equalTo: nextBtn.leadingAnchor,  constant: -8),
 
-            dateLabel.centerYAnchor  .constraint(equalTo: prevBtn.centerYAnchor),
-            dateLabel.leadingAnchor  .constraint(equalTo: prevBtn.trailingAnchor, constant: 8),
-            dateLabel.trailingAnchor .constraint(equalTo: nextBtn.leadingAnchor,  constant: -8),
+            // Zusammenfassung (rechts unter Toolbar)
+            summaryLabel.topAnchor     .constraint(equalTo: prevBtn.bottomAnchor, constant: 8),
+            summaryLabel.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -m),
+            summaryLabel.leadingAnchor .constraint(equalTo: cv.leadingAnchor,  constant: m),
 
-            solarLabel.topAnchor    .constraint(equalTo: prevBtn.bottomAnchor, constant: 14),
-            solarLabel.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: m),
-
-            solarGraph.topAnchor     .constraint(equalTo: solarLabel.bottomAnchor, constant: 4),
+            // Solar-Graph
+            solarLbl.topAnchor    .constraint(equalTo: summaryLabel.bottomAnchor, constant: 6),
+            solarLbl.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: m),
+            solarGraph.topAnchor     .constraint(equalTo: solarLbl.bottomAnchor, constant: 4),
             solarGraph.leadingAnchor .constraint(equalTo: cv.leadingAnchor,  constant: m),
             solarGraph.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -m),
-            solarGraph.heightAnchor  .constraint(greaterThanOrEqualToConstant: 120),
+            solarGraph.heightAnchor  .constraint(greaterThanOrEqualToConstant: 110),
 
-            gridLabel.topAnchor    .constraint(equalTo: solarGraph.bottomAnchor, constant: 14),
-            gridLabel.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: m),
-
-            gridGraph.topAnchor     .constraint(equalTo: gridLabel.bottomAnchor, constant: 4),
+            // Grid-Graph
+            gridLbl.topAnchor    .constraint(equalTo: solarGraph.bottomAnchor, constant: 12),
+            gridLbl.leadingAnchor.constraint(equalTo: cv.leadingAnchor, constant: m),
+            gridGraph.topAnchor     .constraint(equalTo: gridLbl.bottomAnchor, constant: 4),
             gridGraph.leadingAnchor .constraint(equalTo: cv.leadingAnchor,  constant: m),
             gridGraph.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -m),
-            gridGraph.bottomAnchor  .constraint(equalTo: cv.bottomAnchor,   constant: -m),
-
             solarGraph.heightAnchor.constraint(equalTo: gridGraph.heightAnchor),
+
+            // Wochentabelle (Höhe = 0 wenn ausgeblendet)
+            tableScroll.topAnchor     .constraint(equalTo: gridGraph.bottomAnchor, constant: 12),
+            tableScroll.leadingAnchor .constraint(equalTo: cv.leadingAnchor,  constant: m),
+            tableScroll.trailingAnchor.constraint(equalTo: cv.trailingAnchor, constant: -m),
+            tableScroll.bottomAnchor  .constraint(equalTo: cv.bottomAnchor,   constant: -m),
+            tableHeightConstraint,
         ])
     }
+
+    // MARK: Navigation & Reload
 
     @objc private func prevDay() {
         selectedDate = Calendar.current.date(byAdding: .day, value: -1, to: selectedDate)!
@@ -673,12 +767,10 @@ final class HistoryWindowController: NSWindowController {
     @objc private func nextDay() {
         let next = Calendar.current.date(byAdding: .day, value: 1, to: selectedDate)!
         guard Calendar.current.startOfDay(for: next) <= Calendar.current.startOfDay(for: Date()) else { return }
-        selectedDate = next
-        reload()
+        selectedDate = next; reload()
     }
     @objc private func rangeChanged() {
-        rangeHours = [1, 6, 24, 168][rangeCtrl.selectedSegment]
-        reload()
+        rangeHours = [1, 6, 24, 168][rangeCtrl.selectedSegment]; reload()
     }
 
     private func reload() {
@@ -692,11 +784,11 @@ final class HistoryWindowController: NSWindowController {
         case 1:   from = cal.date(byAdding: .hour, value:  -1, to: to)!
         case 6:   from = cal.date(byAdding: .hour, value:  -6, to: to)!
         case 168: from = cal.date(byAdding: .day,  value:  -6, to: dayStart)!
-        default:  from = dayStart   // 24h = kompletter gewählter Tag
+        default:  from = dayStart   // 24h = kompletter Tag
         }
 
-        let fmt = DateFormatter()
-        fmt.locale = Locale(identifier: "de_DE")
+        // Datums-Label
+        let fmt = DateFormatter(); fmt.locale = Locale(identifier: "de_DE")
         if rangeHours == 168 {
             fmt.dateFormat = "dd. MMM"
             let toDay = cal.date(byAdding: .day, value: -1, to: dayEnd)!
@@ -706,22 +798,66 @@ final class HistoryWindowController: NSWindowController {
             dateLabel.stringValue = fmt.string(from: selectedDate)
         }
 
+        // Graphen
         let data = DataStore.shared.query(from: from, to: to)
         solarGraph.history = data.solar
         gridGraph.history  = data.grid
         solarGraph.needsDisplay = true
         gridGraph.needsDisplay  = true
+
+        // kWh-Zusammenfassung
+        let sum  = DataStore.shared.sumWh(from: from, to: to)
+        let sKWh = sum.solarWh >= 1000 ? String(format: "%.1f kWh", sum.solarWh/1000)
+                                        : String(format: "%.0f Wh",  sum.solarWh)
+        let gKWh = sum.gridWh  >= 1000 ? String(format: "%.1f kWh", sum.gridWh/1000)
+                                        : String(format: "%.0f Wh",  sum.gridWh)
+        summaryLabel.stringValue = "☀︎ \(sKWh) Ertrag  ·  ⚡ \(gKWh) Netzbezug"
+
+        // Wochentabelle ein-/ausblenden
+        let showTable = (rangeHours == 168)
+        if showTable {
+            weekRows = DataStore.shared.weeklyTotals(days: 7)
+            tableView.reloadData()
+            let rowH    = tableView.rowHeight + tableView.intercellSpacing.height
+            let hdrH    = tableView.headerView?.frame.height ?? 22
+            tableHeightConstraint.constant = hdrH + rowH * CGFloat(weekRows.count) + 4
+        } else {
+            tableHeightConstraint.constant = 0
+        }
+        tableScroll.isHidden = !showTable
     }
+
+    // MARK: NSTableViewDataSource / Delegate
+
+    func numberOfRows(in tableView: NSTableView) -> Int { weekRows.count }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        let r = weekRows[row]
+        let fmt = DateFormatter(); fmt.locale = Locale(identifier: "de_DE"); fmt.dateFormat = "E, dd. MMM"
+        let wh2str: (Double) -> String = { wh in
+            wh >= 1000 ? String(format: "%.2f kWh", wh/1000) : String(format: "%.0f Wh", wh)
+        }
+        let text: String
+        switch tableColumn?.identifier.rawValue {
+        case "Datum":        text = fmt.string(from: r.date)
+        case "☀︎  Solar":    text = wh2str(r.solarWh)
+        case "⚡  Netzbezug": text = wh2str(r.gridWh)
+        default: return nil
+        }
+        let cell = NSTextField(labelWithString: text)
+        cell.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        return cell
+    }
+
+    // MARK: Helpers
 
     private func histLabel(_ text: String) -> NSTextField {
         let f = NSTextField(labelWithString: text)
         f.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
-        f.textColor = .secondaryLabelColor
-        return f
+        f.textColor = .secondaryLabelColor; return f
     }
 
     func showCentered() {
-        // Heute automatisch alle 30 s aktualisieren wenn das Fenster offen ist
         if refreshTimer == nil {
             refreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
                 guard let self, self.window?.isVisible == true,
@@ -729,20 +865,25 @@ final class HistoryWindowController: NSWindowController {
                 self.reload()
             }
         }
-        window?.center()
-        NSApp.activate(ignoringOtherApps: true)
-        showWindow(nil)
+        window?.center(); NSApp.activate(ignoringOtherApps: true); showWindow(nil)
     }
 }
 
 // MARK: - Solar-Graph
 
 final class SolarGraphView: NSView {
-    var history: [(time: Date, watts: Int)] = []
-    var accent: NSColor = NSColor(red: 1.0, green: 0.55, blue: 0.0, alpha: 1.0)
+    var history:  [(time: Date, watts: Int)] = []
+    var accent:   NSColor = NSColor(red: 1.0, green: 0.55, blue: 0.0, alpha: 1.0)
+    /// Callback für Scroll-Zoom im Verlauf-Fenster (deltaY: pos = rein, neg = raus)
+    var onScroll: ((CGFloat) -> Void)?
 
     private func dyn(light: NSColor, dark: NSColor) -> NSColor {
         NSColor(name: nil) { $0.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua ? dark : light }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        if let cb = onScroll { cb(event.scrollingDeltaY) }
+        else { super.scrollWheel(with: event) }
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -754,34 +895,41 @@ final class SolarGraphView: NSView {
             let a: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11),
                                                     .foregroundColor: NSColor.tertiaryLabelColor]
             let sz = s.size(withAttributes: a)
-            s.draw(at: CGPoint(x: (bounds.width-sz.width)/2, y: (bounds.height-sz.height)/2), withAttributes: a)
+            s.draw(at: CGPoint(x: (bounds.width-sz.width)/2,
+                               y: (bounds.height-sz.height)/2), withAttributes: a)
             return
         }
 
-        let display: [(time: Date, watts: Int)] = history.count > 400
-            ? stride(from: 0, to: history.count, by: max(history.count/400, 1)).map { history[$0] }
+        let display: [(time: Date, watts: Int)] = history.count > 600
+            ? stride(from: 0, to: history.count, by: max(history.count/600, 1)).map { history[$0] }
             : history
 
         let maxW = max(display.map { $0.watts }.max() ?? 1, 1)
         let top  = ((maxW / 50) + 1) * 50
-        let ml: CGFloat = 36, mr: CGFloat = 8, mt: CGFloat = 20, mb: CGFloat = 18
+        let ml: CGFloat = 38, mr: CGFloat = 8, mt: CGFloat = 20, mb: CGFloat = 22
         let plot = CGRect(x: ml, y: mb, width: bounds.width-ml-mr, height: bounds.height-mt-mb)
         let subtle = dyn(light: NSColor(white: 0.55, alpha: 1), dark: NSColor(white: 0.55, alpha: 1))
+        let xa: [NSAttributedString.Key: Any] = [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular),
+            .foregroundColor: subtle]
 
+        // ── Y-Achse ──────────────────────────────────────────────────────────
         for lv in [0, top/2, top] {
             let y = plot.minY + plot.height * CGFloat(lv) / CGFloat(top)
-            let g = NSBezierPath(); g.move(to: CGPoint(x: plot.minX, y: y)); g.line(to: CGPoint(x: plot.maxX, y: y))
+            let g = NSBezierPath()
+            g.move(to: CGPoint(x: plot.minX, y: y)); g.line(to: CGPoint(x: plot.maxX, y: y))
             NSColor.separatorColor.setStroke(); g.lineWidth = 0.5; g.stroke()
-            let lbl = "\(lv) W" as NSString
-            let a: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular), .foregroundColor: subtle]
-            let sz = lbl.size(withAttributes: a)
-            lbl.draw(at: CGPoint(x: plot.minX-sz.width-4, y: y-sz.height/2), withAttributes: a)
+            let lbl = lv >= 1000 ? String(format: "%.0fk", Double(lv)/1000) : "\(lv)W"
+            let sz = (lbl as NSString).size(withAttributes: xa)
+            (lbl as NSString).draw(at: CGPoint(x: plot.minX-sz.width-4, y: y-sz.height/2),
+                                   withAttributes: xa)
         }
 
+        // ── Kurve ────────────────────────────────────────────────────────────
         let n = display.count
         func pt(_ i: Int) -> CGPoint {
-            CGPoint(x: plot.minX + plot.width*CGFloat(i)/CGFloat(n-1),
-                    y: plot.minY + plot.height*CGFloat(display[i].watts)/CGFloat(top))
+            CGPoint(x: plot.minX + plot.width * CGFloat(i) / CGFloat(n-1),
+                    y: plot.minY + plot.height * CGFloat(display[i].watts) / CGFloat(top))
         }
         let fill = NSBezierPath()
         fill.move(to: CGPoint(x: pt(0).x, y: plot.minY)); fill.line(to: pt(0))
@@ -791,23 +939,78 @@ final class SolarGraphView: NSView {
 
         let line = NSBezierPath()
         line.move(to: pt(0)); for i in 1..<n { line.line(to: pt(i)) }
-        accent.setStroke(); line.lineWidth = 1.5; line.lineCapStyle = .round; line.lineJoinStyle = .round; line.stroke()
+        accent.setStroke(); line.lineWidth = 1.5
+        line.lineCapStyle = .round; line.lineJoinStyle = .round; line.stroke()
 
-        ("\(display.last!.watts) W" as NSString).draw(
+        // ── Aktueller Wert (oben links) ──────────────────────────────────────
+        let curW   = display.last!.watts
+        let curLbl = curW >= 1000 ? String(format: "%.2f kW", Double(curW)/1000) : "\(curW) W"
+        (curLbl as NSString).draw(
             at: CGPoint(x: ml, y: bounds.height-mt),
             withAttributes: [.font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .semibold),
                              .foregroundColor: dyn(light: .black, dark: .white)])
 
-        let fmt = DateFormatter()
-        let span = display.last!.time.timeIntervalSince(display.first!.time)
-        fmt.dateFormat = span > 72000 ? "dd. HH:mm" : "HH:mm"
-        let xPts: [(CGFloat, String)] = [
-            (plot.minX,                fmt.string(from: display.first!.time)),
-            (plot.minX + plot.width/2, fmt.string(from: display[n/2].time)),
-            (plot.maxX,                "jetzt")]
-        let xa: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular), .foregroundColor: subtle]
-        for (x, t) in xPts { let s = t as NSString; let sz = s.size(withAttributes: xa)
-            s.draw(at: CGPoint(x: x-sz.width/2, y: 1), withAttributes: xa) }
+        // ── X-Achse: zeitausgerichtete Ticks ─────────────────────────────────
+        let first = display.first!.time
+        let last  = display.last!.time
+        let span  = max(last.timeIntervalSince(first), 1)
+        let cal   = Calendar.current
+
+        struct XTick { var date: Date; var label: String }
+        var ticks: [XTick] = []
+
+        if span >= 86400 * 2 {
+            // Mehrtägig → tägliche Ticks an lokalem Mitternacht, Label = Wochentag
+            let fmt = DateFormatter(); fmt.locale = Locale(identifier: "de_DE")
+            fmt.dateFormat = "E"
+            var t = cal.startOfDay(for: first)
+            if t <= first { t = cal.date(byAdding: .day, value: 1, to: t)! }
+            while t <= last {
+                ticks.append(XTick(date: t, label: fmt.string(from: t)))
+                t = cal.date(byAdding: .day, value: 1, to: t)!
+            }
+        } else {
+            // Stunden/Minuten-Ticks (UTC-Rundung, für Stunden ausreichend genau)
+            let (tickSecs, fmtStr): (TimeInterval, String)
+            switch span {
+            case ..<3_600:   (tickSecs, fmtStr) = (600,   "HH:mm")  // < 1 h : alle 10 min
+            case ..<7_200:   (tickSecs, fmtStr) = (900,   "HH:mm")  // < 2 h : alle 15 min
+            case ..<21_600:  (tickSecs, fmtStr) = (3_600, "HH:mm")  // < 6 h : stündlich
+            default:         (tickSecs, fmtStr) = (7_200, "HH:mm")  // ≥ 6 h : alle 2 h
+            }
+            let fmt = DateFormatter(); fmt.locale = Locale(identifier: "de_DE")
+            fmt.dateFormat = fmtStr
+            var t = Date(timeIntervalSince1970:
+                         ceil(first.timeIntervalSince1970 / tickSecs) * tickSecs)
+            while t <= last {
+                ticks.append(XTick(date: t, label: fmt.string(from: t)))
+                t = Date(timeIntervalSince1970: t.timeIntervalSince1970 + tickSecs)
+            }
+        }
+
+        // "jetzt" nur wenn letzter Datenpunkt < 5 min alt
+        let showJetzt = -last.timeIntervalSinceNow < 300
+
+        for tick in ticks {
+            let frac = CGFloat(tick.date.timeIntervalSince(first) / span)
+            let x = plot.minX + frac * plot.width
+            let s  = tick.label as NSString
+            let sz = s.size(withAttributes: xa)
+            let rightClear: CGFloat = showJetzt ? 32 : 4
+            guard x > plot.minX + sz.width/2 + 4,
+                  x < plot.maxX - rightClear else { continue }
+            // Tick-Strich
+            let tp = NSBezierPath()
+            tp.move(to: CGPoint(x: x, y: plot.minY))
+            tp.line(to: CGPoint(x: x, y: plot.minY - 3))
+            NSColor.separatorColor.setStroke(); tp.lineWidth = 0.5; tp.stroke()
+            s.draw(at: CGPoint(x: x - sz.width/2, y: 1), withAttributes: xa)
+        }
+        if showJetzt {
+            let s  = "jetzt" as NSString
+            let sz = s.size(withAttributes: xa)
+            s.draw(at: CGPoint(x: plot.maxX - sz.width/2, y: 1), withAttributes: xa)
+        }
     }
 }
 
@@ -831,6 +1034,9 @@ final class ZendureBarController: NSObject {
 
     private var settingsController: SettingsWindowController?
     private var historyController:  HistoryWindowController?
+
+    // Menüleisten-Anzeige: 0 = aktuelles Solar-W, 1 = Tagesertrag kWh, 2 = Tages-Netzbezug kWh
+    private var statusMode = 0
 
     private let primaryColor = NSColor(name: nil) { app in
         app.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
@@ -948,8 +1154,23 @@ final class ZendureBarController: NSObject {
     }
 
     private func updateStatusButton() {
-        let total = deviceData.values.reduce(0) { $0 + $1.solarPower }
-        statusItem.button?.title = total > 0 ? "\(total) W" : "— W"
+        switch statusMode {
+        case 1:
+            let s = DataStore.shared.sumWh(from: Calendar.current.startOfDay(for: Date()), to: Date())
+            let wh = s.solarWh
+            statusItem.button?.title = wh >= 1000
+                ? String(format: "☀︎ %.1f kWh", wh/1000)
+                : String(format: "☀︎ %.0f Wh",  wh)
+        case 2:
+            let s = DataStore.shared.sumWh(from: Calendar.current.startOfDay(for: Date()), to: Date())
+            let wh = s.gridWh
+            statusItem.button?.title = wh >= 1000
+                ? String(format: "⚡ %.1f kWh", wh/1000)
+                : String(format: "⚡ %.0f Wh",  wh)
+        default:
+            let total = deviceData.values.reduce(0) { $0 + $1.solarPower }
+            statusItem.button?.title = total > 0 ? "\(total) W" : "— W"
+        }
     }
 
     // MARK: - Menü
@@ -1014,8 +1235,17 @@ final class ZendureBarController: NSObject {
             }
         }
 
+        // Anzeige-Toggle (Menüleiste)
+        let modeLabels = ["Aktuelles Solar (W)", "Tagesertrag Solar (kWh)", "Tages-Netzbezug (kWh)"]
+        let nextMode   = (statusMode + 1) % 3
+        let tm = NSMenuItem(title: "Anzeige: \(modeLabels[statusMode])",
+                            action: #selector(cycleStatusMode), keyEquivalent: "")
+        tm.target = self; menu.addItem(tm)
+        menu.addItem(.separator())
+
         let h = NSMenuItem(title: "Verlauf…", action: #selector(openHistory), keyEquivalent: "h")
         h.target = self; menu.addItem(h)
+        _ = nextMode
         let s = NSMenuItem(title: "Einstellungen…", action: #selector(openSettings), keyEquivalent: ",")
         s.target = self; menu.addItem(s)
         menu.addItem(NSMenuItem(title: "Beenden", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
@@ -1134,6 +1364,12 @@ final class ZendureBarController: NSObject {
             self.buildMenu()
         }
         ctrl.showCentered(); settingsController = ctrl
+    }
+
+    @objc func cycleStatusMode() {
+        statusMode = (statusMode + 1) % 3
+        updateStatusButton()
+        buildMenu()
     }
 
     @objc func openHistory() {
