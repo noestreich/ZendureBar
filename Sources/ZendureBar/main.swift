@@ -692,7 +692,7 @@ final class HistoryWindowController: NSWindowController, NSTableViewDataSource, 
         gridGraph.onScroll  = scrollZoom
 
         // ── Wochentabelle ─────────────────────────────────────────────────────
-        for col in [("Datum", 140), ("☀︎  Solar", 130), ("⚡  Netzbezug", 130)] as [(String, Int)] {
+        for col in [("Datum", 120), ("☀︎  Solar", 110), ("⚡  Netzbezug", 110), ("Σ  Gesamt", 110)] as [(String, Int)] {
             let c = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(col.0))
             c.title = col.0; c.width = CGFloat(col.1); c.resizingMask = .autoresizingMask
             tableView.addTableColumn(c)
@@ -842,6 +842,7 @@ final class HistoryWindowController: NSWindowController, NSTableViewDataSource, 
         case "Datum":        text = fmt.string(from: r.date)
         case "☀︎  Solar":    text = wh2str(r.solarWh)
         case "⚡  Netzbezug": text = wh2str(r.gridWh)
+        case "Σ  Gesamt":   text = wh2str(r.solarWh + r.gridWh)
         default: return nil
         }
         let cell = NSTextField(labelWithString: text)
